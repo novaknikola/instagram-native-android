@@ -1,0 +1,175 @@
+{% extends "base.html" %}
+
+{% block title %}Fleet Screens{% endblock %}
+{% block page_title %}Fleet Screens{% endblock %}
+{% block page_sub %}Device shelf · cached thumbs · capture only when you ask{% endblock %}
+
+{% block top_actions %}
+<button type="button" class="btn btn-primary" id="btn-update-stale">Update stale</button>
+<button type="button" class="btn" id="btn-update-selected">Update selected</button>
+<button type="button" class="btn" id="btn-update-all">Update all</button>
+<button type="button" class="btn danger" id="btn-stop-updates" disabled>Stop</button>
+<button type="button" class="btn btn-ghost" id="btn-rescan">Rescan ADB</button>
+{% endblock %}
+
+{% block body %}
+{% if not pillow_ok %}
+<div class="alert-banner alert-warn" role="status">
+  <div class="alert-title">Pillow missing</div>
+  <p>Install thumbs: <code>pip install Pillow</code> then restart the console. Grid needs JPEG thumbs (not full PNGs).</p>
+</div>
+{% endif %}
+
+<section class="fleet-shelf" aria-label="Phone fleet shelf">
+  <div class="fleet-strip">
+    <div class="fleet-counts" id="fleet-counts" aria-live="polite">
+      <span class="fleet-pill" data-k="phones"><b id="cnt-phones">—</b> phones</span>
+      <span class="fleet-pill is-ok" data-k="fresh"><b id="cnt-fresh">—</b> fresh</span>
+      <span class="fleet-pill is-warn" data-k="stale"><b id="cnt-stale">—</b> stale</span>
+      <span class="fleet-pill is-mute" data-k="missing"><b id="cnt-missing">—</b> missing</span>
+      <span class="fleet-pill" data-k="adb" id="pill-adb">ADB …</span>
+      <span class="fleet-pill" data-k="farm" id="pill-farm">Farm …</span>
+    </div>
+    <div class="fleet-strip-right">
+      <div class="screens-filters" role="tablist" aria-label="Filter phones">
+        <button type="button" class="chip-btn is-on" data-filter="all">All</button>
+        <button type="button" class="chip-btn" data-filter="needs">Needs update</button>
+        <button type="button" class="chip-btn" data-filter="injob">In job</button>
+        <button type="button" class="chip-btn" data-filter="problems">Problems</button>
+      </div>
+      <label class="check screens-wake">
+        <input type="checkbox" id="screens-wake">
+        <span>Wake before capture</span>
+      </label>
+    </div>
+  </div>
+
+  <p class="screens-status" id="screens-status">Loading phones…</p>
+
+  <div class="screens-progress" id="screens-progress" hidden>
+    <div class="screens-progress-bar"><span id="screens-progress-fill"></span></div>
+    <p class="muted" id="screens-progress-label"></p>
+  </div>
+
+  <div class="screens-grid" id="screens-grid" aria-live="polite"></div>
+</section>
+{% endblock %}
+
+{% block overlay %}
+<div class="screens-lightbox" id="screens-lightbox" hidden role="dialog" aria-modal="true" aria-labelledby="viewer-title">
+  <div class="viewer-shell" id="viewer-shell">
+    <header class="viewer-top">
+      <div class="viewer-top-left">
+        <span class="viewer-kicker">Device control</span>
+        <h2 class="viewer-title" id="viewer-title">Phone</h2>
+      </div>
+      <div class="viewer-top-right">
+        <div class="viewer-zoom-controls" role="group" aria-label="Zoom">
+          <button type="button" class="viewer-zoom-btn" id="lightbox-zoom-out" title="Zoom out" aria-label="Zoom out">−</button>
+          <span class="viewer-zoom-label" id="lightbox-zoom-label">100%</span>
+          <button type="button" class="viewer-zoom-btn" id="lightbox-zoom-in" title="Zoom in" aria-label="Zoom in">+</button>
+          <button type="button" class="viewer-zoom-btn" id="lightbox-zoom-reset" title="Reset zoom" aria-label="Reset zoom">Reset</button>
+        </div>
+        <span class="viewer-pos" id="lightbox-pos">—</span>
+        <button type="button" class="viewer-x" id="lightbox-close" aria-label="Close">×</button>
+      </div>
+    </header>
+
+    <div class="viewer-body" id="lightbox-stage">
+      <button type="button" class="viewer-nav" id="lightbox-prev" aria-label="Previous phone">‹</button>
+
+      <div class="viewer-device-col">
+        <div class="viewer-stage" id="viewer-stage" title="Scroll to pan · Ctrl/Cmd + wheel to zoom">
+          <div class="viewer-zoom-space" id="viewer-zoom-space">
+            <div class="viewer-zoom-inner" id="viewer-zoom-inner">
+              <div class="viewer-phone" id="viewer-phone">
+                <div class="viewer-ear" aria-hidden="true">
+                  <span class="viewer-speaker"></span>
+                  <span class="viewer-cam"></span>
+                </div>
+                <div class="viewer-glass">
+                  <div class="viewer-spinner" id="lightbox-spinner" hidden aria-hidden="true"></div>
+                  <img id="lightbox-img" alt="Full phone screenshot">
+                  <div class="viewer-empty" id="lightbox-empty" hidden>
+                    <strong>No screenshot yet</strong>
+                    <span>Capture this phone to fill the screen.</span>
+                  </div>
+                </div>
+                <div class="viewer-chin" aria-hidden="true">
+                  <span class="viewer-home"></span>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <aside class="viewer-side" aria-label="Device details">
+        <div class="viewer-side-block">
+          <div class="viewer-label">Serial</div>
+          <div class="viewer-short" id="lightbox-short">—</div>
+          <code class="viewer-serial mono" id="lightbox-serial">—</code>
+          <button type="button" class="link viewer-copy" id="lightbox-copy-serial">Copy serial</button>
+        </div>
+
+        <div class="viewer-side-grid">
+          <div class="viewer-side-block">
+            <div class="viewer-label">Status</div>
+            <span class="viewer-badge" id="lightbox-badge">—</span>
+          </div>
+          <div class="viewer-side-block">
+            <div class="viewer-label">Age</div>
+            <div class="viewer-value" id="lightbox-age">—</div>
+          </div>
+        </div>
+
+        <div class="viewer-side-block viewer-err-wrap" id="lightbox-err-wrap" hidden>
+          <div class="viewer-label">Error</div>
+          <p class="viewer-err" id="lightbox-err"></p>
+        </div>
+
+        <div class="viewer-actions">
+          <button type="button" class="btn btn-primary viewer-btn-wide" id="lightbox-refresh">Refresh screen</button>
+          <a class="btn viewer-btn-wide" id="lightbox-open-full" href="#" target="_blank" rel="noopener">Open full PNG</a>
+          <button type="button" class="btn viewer-btn-wide" id="lightbox-device-log">Latest device log</button>
+        </div>
+
+        <p class="viewer-keys">
+          <kbd>Esc</kbd> close
+          <kbd>←</kbd> <kbd>→</kbd> switch
+          <kbd>Ctrl</kbd>+wheel zoom
+        </p>
+      </aside>
+
+      <button type="button" class="viewer-nav" id="lightbox-next" aria-label="Next phone">›</button>
+    </div>
+
+    <div class="viewer-log-panel" id="viewer-log-panel" hidden>
+      <div class="viewer-log-head">
+        <div class="viewer-log-head-left">
+          <div class="viewer-label">Latest automation log · this phone</div>
+          <span class="viewer-log-meta" id="lightbox-log-meta"></span>
+        </div>
+        <div class="viewer-log-head-actions">
+          <button type="button" class="btn btn-ghost viewer-log-btn" id="lightbox-log-reload">Reload</button>
+          <button type="button" class="btn btn-ghost viewer-log-btn" id="lightbox-log-close">Hide</button>
+        </div>
+      </div>
+      <pre class="viewer-log-pane" id="lightbox-log-pane">(click Latest device log)</pre>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  document.addEventListener("DOMContentLoaded", function () {
+    if (window.IGConsole && IGConsole.bindFleetScreens) {
+      IGConsole.bindFleetScreens({
+        staleSecs: {{ stale_secs|int }},
+        farmActive: {{ 'true' if farm_active else 'false' }}
+      });
+    }
+  });
+</script>
+{% endblock %}

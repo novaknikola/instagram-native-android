@@ -1,0 +1,7 @@
+# Rename to vision_key.txt and paste ONE key on the first line.
+# Provider is auto: Gemini if the key looks like Google, else set:
+#   set IG_VISION_PROVIDER=gemini
+#   set IG_VISION_PROVIDER=grok
+#
+# Gemini: https://aistudio.google.com/apikey
+# Grok/xAI: https://console.x.ai/

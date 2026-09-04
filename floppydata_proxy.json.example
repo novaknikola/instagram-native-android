@@ -1,0 +1,7 @@
+{
+  "host": "geo.g-w.info",
+  "port": 10080,
+  "username": "PASTE_FULL_USERNAME",
+  "password": "PASTE_PASSWORD",
+  "append_session": true
+}
