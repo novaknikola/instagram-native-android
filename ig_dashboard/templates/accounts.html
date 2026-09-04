@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% from "macros.html" import panel, login_badge, post_badge, stat, pager %}
+
+{% block title %}Accounts{% endblock %}
+{% block page_title %}Account Pool{% endblock %}
+{% block page_sub %}Instagram_farm_accounts.csv · joined with latest IG outcome{% endblock %}
+
+{% block body %}
+<section class="stat-row">
+  {{ stat('Total', pool.total) }}
+  {{ stat('Tried', pool.tried) }}
+  {{ stat('Untried', pool.untried) }}
+  {{ stat('Posted', pool.posted, 'ok') }}
+</section>
+
+<div class="layout-2">
+  {% call panel('Filter pool', 'QUERY') %}
+    <form method="get" class="form-inline">
+      <input type="hidden" name="per_page" value="{{ per_page|default(25) }}">
+      <label>
+        <span>Status</span>
+        <select name="status">
+          <option value="">all</option>
+          <option value="live" {% if status=='live' %}selected{% endif %}>POST_DONE</option>
+          <option value="not_run" {% if status=='not_run' %}selected{% endif %}>NOT_RUN</option>
+          <option value="failed" {% if status=='failed' %}selected{% endif %}>failed / skipped</option>
+        </select>
+      </label>
+      <button class="btn btn-primary" type="submit">Apply</button>
+    </form>
+  {% endcall %}
+
+  {% call panel('Add account', 'POOL') %}
+    <form method="post" action="{{ url_for('pages.accounts_add') }}" class="form-grid">
+      <label><span>Username</span><input name="username" required></label>
+      <label><span>Password</span><input name="password" type="password" required></label>
+      <label><span>2FA secret</span><input name="tfa_secret" required></label>
+      <input type="hidden" name="model" value="ig">
+      <div class="span-2">
+        <button class="btn btn-primary" type="submit">Add to pool</button>
+      </div>
+    </form>
+  {% endcall %}
+</div>
+
+{% call panel('Accounts (%d matching)'|format(total), 'LEDGER JOIN') %}
+  <div class="table-wrap">
+    <table class="data">
+      <thead>
+        <tr><th>Username</th><th>Model</th><th>Last login</th><th>Last post</th><th>When</th></tr>
+      </thead>
+      <tbody>
+        {% for a in rows %}
+        <tr>
+          <td>{{ a.username }}</td>
+          <td>{{ a.model }}</td>
+          <td>{{ login_badge(a.login) }}</td>
+          <td>{{ post_badge(a.post) }}</td>
+          <td class="mono muted">{{ a.time or '-' }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="muted">No accounts match.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {{ pager('pages.accounts', page, pages_n, total, per_page) }}
+{% endcall %}
+{% endblock %}

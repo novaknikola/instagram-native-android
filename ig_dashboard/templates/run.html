@@ -1,0 +1,375 @@
+{% extends "base.html" %}
+{% from "macros.html" import panel %}
+
+{% block title %}Run{% endblock %}
+{% block page_title %}Run Control{% endblock %}
+{% block page_sub %}Launch parallel IG farm · per-phone status · live log{% endblock %}
+
+{% block body %}
+<section class="stat-row">
+  <div class="stat {% if run.active %}stat-live{% endif %}">
+    <div class="stat-value">{{ run.label }}</div>
+    <div class="stat-label">Farm process</div>
+  </div>
+  <div class="stat">
+    <div class="stat-value">{{ fleet.phones }}</div>
+    <div class="stat-label">ADB phones</div>
+  </div>
+  <div class="stat">
+    <div class="stat-value">{{ fleet.ready }}</div>
+    <div class="stat-label">Native IG ready</div>
+  </div>
+  <div class="stat">
+    <div class="stat-value">{{ fleet.unique_clones|default(0) }}</div>
+    <div class="stat-label">Play Store IG apps</div>
+  </div>
+  {% if fleet.allowlist_on %}
+  <div class="stat stat-ok">
+    <div class="stat-value">{{ fleet.open_ok_clones|default(0) }}</div>
+    <div class="stat-label">OPEN_OK (farm)</div>
+  </div>
+  <div class="stat {% if fleet.ignored_clones %}stat-live{% endif %}">
+    <div class="stat-value">{{ fleet.ignored_clones|default(0) }}</div>
+    <div class="stat-label">Ignored clones</div>
+  </div>
+  {% endif %}
+</section>
+
+<div class="layout-2 layout-2-equal">
+  {% call panel('Launch batch', 'COMMAND') %}
+    {% if proxy is defined and not proxy.ok %}
+    <div class="toast toast-bad" style="margin-bottom:14px">
+      Cannot start posting until the proxy pool is up. {{ proxy.msg }}
+    </div>
+    {% endif %}
+    <form method="post" action="{{ url_for('pages.run_start') }}" class="form-grid" data-busy="Starting farm…">
+      <label>
+        <span>Country</span>
+        <select name="country">
+          <option value="us">US (primary)</option>
+          <option value="uk">UK / GB fallback path</option>
+        </select>
+      </label>
+      <label>
+        <span>Format (batch default)</span>
+        <select name="format">
+          <option value="reel" selected>reel</option>
+          <option value="feed">feed (post)</option>
+          <option value="carousel">carousel</option>
+          <option value="story">story</option>
+        </select>
+      </label>
+      <label class="check span-2">
+        <input type="checkbox" name="e2e" value="1">
+        <span>E2E pack — reel + feed + story (link sticker + highlight) on each phone</span>
+      </label>
+      <label>
+        <span>Story link (sticker URL)</span>
+        <input name="story_link" type="url" placeholder="https://…">
+      </label>
+      <label>
+        <span>Highlight title</span>
+        <input name="highlight" type="text" value="Highlights" placeholder="Highlights">
+      </label>
+      <label>
+        <span>Max phones at once (0 = all)</span>
+        <input name="max_inflight" type="number" min="0" max="20" value="0" title="GB throttle: e.g. 8 limits concurrent IG apps">
+      </label>
+      <label>
+        <span>Limit accounts (0 = no limit)</span>
+        <input name="limit" type="number" min="0" value="0">
+      </label>
+      <label class="span-2">
+        <span>Devices (comma serials, blank = all)</span>
+        <input name="devices" id="run-devices" type="text" placeholder="ce0817…,988e50…">
+      </label>
+      <div class="span-2 device-quick-actions">
+        <button type="button" class="btn btn-ghost" id="btn-select-all-ready">All ready phones</button>
+        <button type="button" class="btn btn-ghost" id="btn-clear-devices">Clear</button>
+        <span class="hint muted">1 nalog po telefonu · native Play Store IG · Max phones=8 štedi GB</span>
+      </div>
+      <label class="check">
+        <input type="checkbox" name="allow_unproven" value="1">
+        <span>Allow unproven (Threads never LOGGED_IN)</span>
+      </label>
+      <label class="check warn-check">
+        <input type="checkbox" name="serial" value="1">
+        <span>Serial phones (one at a time — escape hatch)</span>
+      </label>
+      <div class="span-2 form-actions">
+        <button class="btn btn-primary" type="submit"
+          {% if run.active or (proxy is defined and not proxy.ok) or (health is defined and health.blockers) %}disabled{% endif %}>
+          Start posting
+        </button>
+        {% if proxy is defined and not proxy.ok %}
+        <span class="hint warn">Start <code>start_proxy_pool.bat</code> first, then refresh.</span>
+        {% elif health is defined and health.blockers %}
+        <span class="hint warn">{{ health.blockers[0] }}</span>
+        {% elif run.active %}
+        <span class="hint warn">Run active since {{ run.started_at or '-' }} - Stop or wait.</span>
+        {% else %}
+        <span class="hint">This button starts the farm. Leave the Console window open. Do not run <code>run_ig_farm.bat</code>.</span>
+        {% endif %}
+      </div>
+    </form>
+    {% if run.active %}
+    <form method="post" action="{{ url_for('pages.run_stop') }}" class="form-inline" style="margin-top:12px"
+          data-busy="Stopping farm…">
+      <input type="hidden" name="next" value="run">
+      <button class="btn danger" type="submit">Stop run</button>
+    </form>
+    {% endif %}
+  {% endcall %}
+
+  {% call panel('Ready phones', 'FLEET', 'panel-fleet') %}
+    <p class="device-scroll-hint muted">Click a serial to add · native Instagram installed</p>
+    <div class="device-scroll" role="region" aria-label="Ready phones">
+      <ul class="device-list">
+        {% for d in fleet.devices %}
+        <li class="{% if d.ready %}is-ready{% endif %}"
+            data-serial="{{ d.serial }}"
+            title="Add {{ d.serial }} to Devices">
+          <span class="mono">{{ d.serial[-10:] if d.serial|length > 10 else d.serial }}</span>
+          <span>{% if d.unique %}native IG{% else %}no Play Store IG{% endif %}</span>
+        </li>
+        {% else %}
+        <li class="muted">No devices</li>
+        {% endfor %}
+      </ul>
+    </div>
+  {% endcall %}
+</div>
+
+{% call panel('Fleet board', 'PARALLEL STATUS') %}
+  <div class="fleet-board-meta">
+    <span class="muted" id="fleet-board-mode">Mode —</span>
+    <span class="muted" id="fleet-board-active">—</span>
+  </div>
+  <div class="table-wrap">
+    <table class="data fleet-board-table" id="fleet-board-table">
+      <thead>
+        <tr>
+          <th>Serial</th><th>User</th><th>Clone</th><th>Format</th><th>Phase</th><th>Login</th><th>Post</th>
+        </tr>
+      </thead>
+      <tbody id="fleet-board-tbody">
+        <tr><td colspan="7" class="muted">Start a run to see per-phone status.</td></tr>
+      </tbody>
+    </table>
+  </div>
+{% endcall %}
+
+{% call panel('Phone monitors', 'ONE PANE PER PHONE') %}
+  <p class="hint">20 phones → 20 windows. Each pane is that phone’s own log (not the merged conductor file). Click a header to enlarge.</p>
+  <div class="phone-log-meta">
+    <span class="muted" id="phone-log-count">0 phones</span>
+    <span class="muted" id="phone-log-dir"></span>
+  </div>
+  <div class="phone-log-grid" id="phone-log-grid">
+    <p class="muted" id="phone-log-empty">Start posting or Run due now — panes appear as each phone process starts.</p>
+  </div>
+{% endcall %}
+
+{% call panel('Live log', 'CONDUCTOR') %}
+  <div class="log-meta">
+    <div>
+      <span class="muted">Current file</span>
+      <code class="mono" id="log-file-name">{{ run.log_name or 'none yet' }}</code>
+    </div>
+    <p class="muted log-path-line" id="log-file-path" title="{{ run.log_path or '' }}">
+      {{ run.log_path or (run.logs_dir ~ '\\ig_run_YYYY-MM-DD_HHMMSS.txt') }}
+    </p>
+    <p class="hint">Each Start creates a conductor file under <code>logs\</code> plus one <code>_phones\{serial}.txt</code> per device. Use the grid above, not this merged stream, to watch phones together.</p>
+  </div>
+  <div class="log-toolbar">
+    <button type="button" class="btn btn-ghost" id="btn-refresh-log">Refresh</button>
+    <a class="btn" id="btn-download-log"
+       href="{{ url_for('pages.run_log_download') }}{% if run.log_name %}?name={{ run.log_name }}{% endif %}">
+      Download current
+    </a>
+    <label class="log-filter-label">
+      <span class="muted">Serial filter</span>
+      <select id="log-serial-filter">
+        <option value="">All phones (merged)</option>
+      </select>
+    </label>
+    <label class="check inline">
+      <input type="checkbox" id="auto-log" checked>
+      <span>Auto-refresh 4s</span>
+    </label>
+  </div>
+  <pre class="log-pane" id="log-pane">{{ log }}</pre>
+  {% if recent_logs %}
+  <div class="log-history">
+    <div class="eyebrow">Recent runs</div>
+    <ul class="log-history-list" id="log-history-list">
+      {% for L in recent_logs %}
+      <li class="{% if L.current %}is-current{% endif %}"
+          data-run-name="{{ L.name }}"
+          title="Open charts for this run">
+        <span class="mono">{{ L.name }}</span>
+        <span class="run-stat">att <b>{{ L.attempts|default(0) }}</b></span>
+        <span class="run-stat">done <b>{{ L.post_done|default(0) }}</b></span>
+        <span class="run-stat"><b>{{ L.success_rate|default(0) }}%</b></span>
+        <span class="run-fail" title="{{ L.top_fail or '' }}">{{ L.top_fail or '—' }}</span>
+        <button type="button" class="btn btn-ghost btn-run-charts"
+                data-run-charts="{{ L.name }}">Charts</button>
+        <a class="link" href="{{ url_for('pages.run_log_download', name=L.name) }}">Download</a>
+      </li>
+      {% endfor %}
+    </ul>
+    <p class="log-history-hint muted">Use <b>Charts</b> for that run’s pie/bars · Download = raw txt</p>
+  </div>
+  {% endif %}
+
+  <div id="run-analytics-panel" class="run-analytics-panel" hidden>
+    <div class="run-an-head">
+      <div>
+        <h3 id="run-an-title">Run analytics</h3>
+        <p class="run-an-meta" id="run-an-meta"></p>
+      </div>
+      <button type="button" class="btn btn-ghost" id="run-an-close">Close</button>
+    </div>
+    <section class="stat-row">
+      <div class="stat">
+        <div class="stat-value" id="run-an-attempts">—</div>
+        <div class="stat-label">Attempts</div>
+      </div>
+      <div class="stat stat-ok">
+        <div class="stat-value" id="run-an-post-done">—</div>
+        <div class="stat-label">POST_DONE</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value" id="run-an-rate">—</div>
+        <div class="stat-label">Success rate</div>
+      </div>
+      <div class="stat">
+        <div class="stat-value" id="run-an-fail">—</div>
+        <div class="stat-label">Top fail</div>
+      </div>
+    </section>
+    <div class="analytics-grid analytics-grid-3">
+      <div class="analytics-card">
+        <p class="analytics-card-title">Post outcomes</p>
+        <div class="analytics-canvas-wrap">
+          <canvas id="run-chart-post"></canvas>
+        </div>
+      </div>
+      <div class="analytics-card">
+        <p class="analytics-card-title">Login outcomes</p>
+        <div class="analytics-canvas-wrap">
+          <canvas id="run-chart-login"></canvas>
+        </div>
+      </div>
+      <div class="analytics-card">
+        <p class="analytics-card-title">Format mix</p>
+        <div class="analytics-canvas-wrap">
+          <canvas id="run-chart-format"></canvas>
+        </div>
+      </div>
+    </div>
+    <div class="table-wrap" style="margin-top:14px">
+      <table class="data">
+        <thead>
+          <tr>
+            <th>Time</th><th>Username</th><th>Format</th><th>Login</th><th>Post</th>
+          </tr>
+        </thead>
+        <tbody id="run-an-tbody">
+          <tr><td colspan="5" class="muted">Select a run.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+{% endcall %}
+
+{% call panel('Error shots', 'HARD FAILS') %}
+  <div class="log-meta">
+    <div>
+      <span class="muted">Shot folder</span>
+      <code class="mono" id="error-shot-dir">{{ run.error_shot_dir or 'none yet' }}</code>
+    </div>
+    <p class="hint">ADB screenshot + UI XML on CAPTCHA, POST_TIMEOUT, UNKNOWN_STUCK, etc. After a job IG may show home (force-stopped) — check shots + board.</p>
+    <p class="hint">Video recordings (default ON): <code class="mono">per device recordings/&lt;stamp&gt;/</code> — one mp4 per phone. Escape: <code>--no-record</code>.</p>
+  </div>
+  <div class="log-toolbar">
+    <button type="button" class="btn btn-ghost" id="btn-refresh-shots">Refresh shots</button>
+    <label class="check inline">
+      <input type="checkbox" id="auto-shots" checked>
+      <span>Auto-refresh 8s</span>
+    </label>
+    <span class="muted" id="error-shot-count">0 shots</span>
+  </div>
+  <div class="error-shot-grid" id="error-shot-grid">
+    <p class="muted" id="error-shot-empty">No error shots for this run yet.</p>
+  </div>
+{% endcall %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+  IGConsole.bindLogTail('{{ url_for("api.api_log") }}', '{{ url_for("api.api_log_device") }}');
+  IGConsole.bindPhoneLogs('{{ url_for("api.api_log_phones") }}');
+  IGConsole.bindFleetBoard('{{ url_for("api.api_fleet_board") }}');
+  IGConsole.bindErrorShots('{{ url_for("api.api_error_shots") }}', '{{ url_for("pages.run_error_shot_file") }}');
+  if (window.IGAnalytics) {
+    IGAnalytics.bindRunAnalytics();
+  }
+  (function () {
+    var split = document.querySelector(".layout-2-equal");
+    var launch = split && split.querySelector(".panel:not(.panel-fleet)");
+    var fleet = split && split.querySelector(".panel-fleet");
+    var input = document.getElementById("run-devices");
+    var list = document.querySelector(".device-scroll .device-list");
+    var btnAll = document.getElementById("btn-select-all-ready");
+    var btnClear = document.getElementById("btn-clear-devices");
+
+    function syncFleetHeight() {
+      if (!split || !launch || !fleet) return;
+      if (window.matchMedia && window.matchMedia("(max-width: 980px)").matches) {
+        fleet.style.height = "";
+        return;
+      }
+      fleet.style.height = launch.offsetHeight + "px";
+    }
+
+    syncFleetHeight();
+    window.addEventListener("resize", syncFleetHeight);
+    if (window.ResizeObserver && launch) {
+      new ResizeObserver(syncFleetHeight).observe(launch);
+    }
+
+    if (btnAll && input && list) {
+      btnAll.addEventListener("click", function () {
+        var parts = [];
+        list.querySelectorAll("li.is-ready[data-serial]").forEach(function (li) {
+          var s = li.getAttribute("data-serial") || "";
+          if (s) parts.push(s);
+        });
+        input.value = parts.join(",");
+        input.focus();
+      });
+    }
+    if (btnClear && input) {
+      btnClear.addEventListener("click", function () {
+        input.value = "";
+        input.focus();
+      });
+    }
+
+    if (!input || !list) return;
+    list.addEventListener("click", function (ev) {
+      var li = ev.target.closest("li[data-serial]");
+      if (!li) return;
+      var serial = li.getAttribute("data-serial") || "";
+      if (!serial) return;
+      var cur = (input.value || "").trim();
+      var parts = cur ? cur.split(/\s*,\s*/).filter(Boolean) : [];
+      if (parts.indexOf(serial) >= 0) return;
+      parts.push(serial);
+      input.value = parts.join(",");
+      input.focus();
+    });
+  })();
+</script>
+{% endblock %}

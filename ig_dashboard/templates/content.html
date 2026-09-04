@@ -1,0 +1,83 @@
+{% extends "base.html" %}
+{% from "macros.html" import panel, stat %}
+
+{% block title %}Content{% endblock %}
+{% block page_title %}Content Bay{% endblock %}
+{% block page_sub %}Jedan Drive folder po telefonu · Reels / Posts / Stories{% endblock %}
+
+{% block body %}
+<p class="lede">
+  Svaki telefon ima svoj Drive folder. Unutra: <code>Reels/</code>, <code>Posts/</code>, <code>Stories/</code>.
+  Claim je po serialu — telefoni ne dele isti pool.
+</p>
+
+<section class="stat-row">
+  {{ stat('Mapped', snap.mapped|default(0), 'ok' if snap.mapped else '') }}
+  {{ stat('Unmapped', snap.missing|default(0), 'warn' if snap.missing else '') }}
+</section>
+{% if snap.error %}
+<div class="toast toast-bad">{{ snap.error }}</div>
+{% endif %}
+
+{% call panel('Parent folder (optional)', 'CHILDREN NAMED BY SERIAL') %}
+  <p class="muted">Jedan parent na Drive-u. Child folderi se zovu pun serial ili last-8. Ili namapiraj ručno ispod.</p>
+  <form method="post" action="{{ url_for('pages.content_phones_root') }}" class="form-inline shared-drive-form" data-busy="Saving…">
+    <label class="grow">
+      <span class="sr-only">Parent folder ID</span>
+      <input name="folder_id" type="text" class="mono" placeholder="Google Drive parent folder ID"
+             value="{{ snap.root_id or '' }}">
+    </label>
+    <button class="btn btn-primary" type="submit">Save parent</button>
+  </form>
+  <p class="hint" style="margin-top:10px">File: <code>{{ snap.root_path }}</code></p>
+{% endcall %}
+
+{% call panel('Phone → folder map', 'JSON OR LINES') %}
+  <p class="muted">JSON <code>{"SERIAL": "FOLDER_ID"}</code> ili linije <code>SERIAL FOLDER_ID</code>. Share svaki folder sa service account.</p>
+  <form method="post" action="{{ url_for('pages.content_phone_map') }}" data-busy="Saving map…">
+    <label class="span-2">
+      <span class="sr-only">Map</span>
+      <textarea name="map_text" rows="10" class="mono" placeholder='{"ce0817…": "1abcFolderId"}'>{{ map_text }}</textarea>
+    </label>
+    <div class="form-actions" style="margin-top:10px">
+      <button class="btn btn-primary" type="submit">Save map</button>
+    </div>
+  </form>
+  <p class="hint">File: <code>{{ snap.map_path }}</code></p>
+{% endcall %}
+
+{% call panel('Phones', 'REELS · POSTS · STORIES') %}
+  <div class="table-wrap">
+    <table class="data">
+      <thead>
+        <tr>
+          <th>Serial</th><th>Folder</th><th>Reels</th><th>Posts</th><th>Stories</th><th></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for p in snap.phones %}
+        <tr>
+          <td class="mono">{{ p.serial[-10:] if p.serial|length > 10 else p.serial }}</td>
+          <td class="mono muted">{{ (p.folder_id[:10] + '…') if p.folder_id else (p.error or '—') }}</td>
+          <td>{% if p.subs.reel == 'missing' %}missing{% else %}{{ p.unused.reel|default(0) }} / {{ p.folder_n.reel|default(0) }}{% endif %}</td>
+          <td>{% if p.subs.feed == 'missing' %}missing{% else %}{{ p.unused.feed|default(0) }} / {{ p.folder_n.feed|default(0) }}{% endif %}</td>
+          <td>{% if p.subs.story == 'missing' %}missing{% else %}{{ p.unused.story|default(0) }} / {{ p.folder_n.story|default(0) }}{% endif %}</td>
+          <td>
+            {% if p.folder_id %}
+            <form method="post" action="{{ url_for('pages.content_reset') }}" class="form-inline"
+                  onsubmit="return confirm('Clear used ledger for this phone?');">
+              <input type="hidden" name="serial" value="{{ p.serial }}">
+              <button type="submit" class="btn btn-ghost danger">Reset ledger</button>
+            </form>
+            {% endif %}
+          </td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="muted">Nema telefona. Uključi ADB ili dodaj serial u mapu.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="hint">Brojevi: unused / u folderu. missing = nema Reels/Posts/Stories child.</p>
+{% endcall %}
+{% endblock %}

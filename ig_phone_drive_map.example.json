@@ -1,0 +1,5 @@
+{
+  "_comment": "serial (or last-8) -> Drive folder ID. Inside each folder: Reels/, Posts/, Stories/. Share with service_account.json client_email.",
+  "ce061716933a145d0c7e": "PUT_FOLDER_ID_HERE",
+  "988a9b39": "PUT_FOLDER_ID_HERE"
+}

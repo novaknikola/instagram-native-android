@@ -1,0 +1,126 @@
+{% extends "base.html" %}
+{% from "macros.html" import panel, stat, pager %}
+
+{% block title %}Lines{% endblock %}
+{% block page_title %}Content lines & warm-up{% endblock %}
+{% block page_sub %}Continuity · replacement · Reels warm-up targets{% endblock %}
+
+{% block body %}
+<section class="stat-row">
+  {{ stat('Lines', lines.count) }}
+  {{ stat('Statuses', statuses.count) }}
+  {{ stat('Warm-up targets', warmup.profiles|length) }}
+</section>
+
+{% call panel('Warm-up profiles', 'DASHBOARD OR .TXT') %}
+  <p class="muted">Scroll Reels → open these profiles’ Reels → Save. File: <code>{{ warmup.path }}</code></p>
+  {% if warmup.error %}<p class="muted">{{ warmup.error }}</p>{% endif %}
+  <form method="post" action="{{ url_for('pages.lines_warmup_save') }}">
+    <label class="span-2">
+      <span>One username per line</span>
+      <textarea name="profiles" rows="8" style="width:100%">{{ warmup.text }}</textarea>
+    </label>
+    <div class="form-actions" style="margin-top:12px">
+      <button class="btn btn-primary" type="submit">Save warm-up list</button>
+    </div>
+  </form>
+{% endcall %}
+
+<div class="layout-2">
+  {% call panel('Bind content line', 'USERNAME → DRIVE FOLDER') %}
+    <form method="post" action="{{ url_for('pages.lines_ensure') }}" class="form-grid">
+      <label>
+        <span>Username</span>
+        <input name="username" required placeholder="ig_user">
+      </label>
+      <label>
+        <span>Drive folder ID</span>
+        <input name="folder_id" required placeholder="1ABC…">
+      </label>
+      <label class="span-2">
+        <span>Warm-up profiles (comma, optional)</span>
+        <input name="warmup_profiles" placeholder="nike,adidas">
+      </label>
+      <div class="span-2 form-actions">
+        <button class="btn btn-primary" type="submit">Ensure line</button>
+      </div>
+    </form>
+    <form method="post" action="{{ url_for('pages.lines_bootstrap') }}" style="margin-top:12px">
+      <button class="btn btn-ghost" type="submit">Bootstrap from Drive map JSON</button>
+    </form>
+  {% endcall %}
+
+  {% call panel('Replace account', 'SAME CONTENT LINE') %}
+    <p class="muted">Replacement keeps Drive folder + used-media pointer. Leave “new” blank to auto-pick from pool.</p>
+    <form method="post" action="{{ url_for('pages.lines_replace') }}" class="form-grid">
+      <label>
+        <span>Dead username</span>
+        <input name="dead" required>
+      </label>
+      <label>
+        <span>New username (optional)</span>
+        <input name="new" placeholder="auto from pool">
+      </label>
+      <div class="span-2 form-actions">
+        <button class="btn btn-primary" type="submit">Replace / continue</button>
+      </div>
+    </form>
+  {% endcall %}
+</div>
+
+{% call panel('Content lines', 'CONTINUITY') %}
+  {% if lines.error %}<p class="muted">{{ lines.error }}</p>{% endif %}
+  <div class="table-wrap">
+    <table class="data">
+      <thead>
+        <tr>
+          <th>Line</th><th>Active user</th><th>Status</th><th>Folder</th><th>Warm-up</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in lines.rows %}
+        <tr>
+          <td class="mono">{{ r.line_id }}</td>
+          <td>{{ r.active_username }}</td>
+          <td>{{ r.status }}</td>
+          <td class="mono muted">{{ (r.drive_folder_id or '')[:18] }}{% if r.drive_folder_id and r.drive_folder_id|length > 18 %}…{% endif %}</td>
+          <td class="muted">{{ (r.warmup_profiles or [])|join(', ') or '-' }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="muted">No lines yet - bootstrap Drive map or bind above.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if line_total is defined %}
+  {{ pager('pages.lines_page', line_page, line_pages, line_total, per_page, page_arg='line_page') }}
+  {% endif %}
+{% endcall %}
+
+{% call panel('Account status', 'HEALTH') %}
+  {% if statuses.error %}<p class="muted">{{ statuses.error }}</p>{% endif %}
+  <div class="table-wrap">
+    <table class="data">
+      <thead>
+        <tr><th>Username</th><th>Status</th><th>Reason</th><th>Replaced by</th><th>Updated</th></tr>
+      </thead>
+      <tbody>
+        {% for r in statuses.rows %}
+        <tr>
+          <td>{{ r.username }}</td>
+          <td>{{ r.status }}</td>
+          <td class="muted">{{ r.reason or '-' }}</td>
+          <td>{{ r.replaced_by or '-' }}</td>
+          <td class="mono muted">{{ r.updated or '-' }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="muted">No status rows yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if status_total is defined %}
+  {{ pager('pages.lines_page', status_page, status_pages, status_total, per_page, page_arg='status_page') }}
+  {% endif %}
+{% endcall %}
+{% endblock %}

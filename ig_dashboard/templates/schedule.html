@@ -1,0 +1,215 @@
+{% extends "base.html" %}
+{% from "macros.html" import panel, stat, pager %}
+
+{% block title %}Schedule{% endblock %}
+{% block page_title %}Schedule{% endblock %}
+{% block page_sub %}Due + upcoming · sticky IP · Drive po telefonu{% endblock %}
+
+{% block body %}
+<section class="stat-row">
+  {{ stat('Due now', sched.counts.due_now, 'warn' if sched.counts.due_now else '') }}
+  {{ stat('Upcoming', sched.counts.upcoming) }}
+  {{ stat('Pending', sched.counts.pending) }}
+  {{ stat('Done', sched.counts.done, 'ok') }}
+  {{ stat('Failed', sched.counts.failed, 'bad' if sched.counts.failed else '') }}
+  {{ stat('Retry-ready', retry_ready|default(0), 'warn' if retry_ready|default(0) else '') }}
+  {{ stat('Sticky binds', sticky.count) }}
+</section>
+
+{% if sched.error %}
+<div class="toast toast-bad">{{ sched.error }}</div>
+{% endif %}
+
+{% call panel('Schedule Google Sheet', 'SOURCE OF TRUTH') %}
+  {% if sheet_cfg.ok %}
+  <p class="muted">Jobs come from this spreadsheet. Paste the Sheet ID (or full spreadsheet URL) and Save — no PowerShell <code>set</code> needed.</p>
+  {% else %}
+  <div class="toast toast-bad" style="margin-bottom:12px">{{ sheet_cfg.error or 'Schedule Sheet not set' }}</div>
+  <p class="muted">Paste the spreadsheet ID from the Sheet URL, then Save. Share the sheet <b>Editor</b> with the farm service account.</p>
+  {% endif %}
+  <form method="post" action="{{ url_for('pages.schedule_sheet_save') }}" class="form-inline shared-drive-form" data-busy="Saving Sheet…">
+    <label class="grow">
+      <span class="sr-only">Schedule Sheet ID</span>
+      <input name="sheet_id" type="text" class="mono" required
+             placeholder="Google Sheet ID or spreadsheet URL"
+             value="{{ sheet_cfg.sheet_id or '' }}">
+    </label>
+    <button class="btn btn-primary" type="submit">Save</button>
+  </form>
+  <p class="hint" style="margin-top:10px">
+    File: <code>{{ sheet_cfg.path }}</code>
+    {% if sheet_cfg.from_env %}· currently overridden by env <code>IG_SCHEDULE_SHEET</code>{% endif %}
+    · share Editor with the farm service account.
+  </p>
+{% endcall %}
+
+{% call panel('Phone Drive folders', 'CONTENT') %}
+  <p class="muted">Sadržaj je po telefonu (<code>Reels/</code> <code>Posts/</code> <code>Stories/</code>). Mapu i parent folder podešavaš na <a href="{{ url_for('pages.content') }}">Content Bay</a>.</p>
+{% endcall %}
+
+{% call panel('Run due', 'SCHEDULER') %}
+  <p class="muted">
+    Source: <b>{{ sched.source }}</b>
+    {% if sched.sheet_id %}· sheet <code>{{ sched.sheet_id[:12] }}…</code>{% endif %}
+    {% if sched.source == 'csv' %}· <code>{{ sched.csv_path }}</code>{% endif %}
+    {% if sched.server_now %}· farm clock <code>{{ sched.server_now }}</code>{% endif %}
+  </p>
+  <p class="muted">Sheet is the source of truth - this page mirrors it. Use the top-right refresh icon to reload from Sheet.</p>
+  <p class="hint">
+    <b>Run due</b> processes <b>all</b> pending Sheet rows, grouped by phone (parallel). Cap with env <code>IG_SCHEDULE_MAX=1</code> if needed.
+    Pin Sheet <code>serial</code>. Reel traces → <code>ig_reel_trace.jsonl</code> + <code>dumps/</code>.
+  </p>
+  <p class="hint">
+    <b>Queue retries</b> adds due-now jobs for latest
+    <code>LOGGED_IN/POST_BLOCKED</code>, <code>LOGGED_IN/POST_TIMEOUT</code>,
+    <code>LOGIN_TIMEOUT/SKIPPED</code>. Original history stays; the new try is marked <b>RETRY</b>.
+    Then click <b>Run due now</b>.
+  </p>
+  <form method="post" action="{{ url_for('pages.schedule_queue_retries') }}" class="form-inline" style="gap:12px;margin-top:12px"
+        data-busy="Queueing retries…">
+    <button class="btn" type="submit" {% if run.active %}disabled{% endif %}>
+      Queue retries{% if retry_ready|default(0) %} ({{ retry_ready }}){% endif %}
+    </button>
+  </form>
+  <form method="post" action="{{ url_for('pages.schedule_run') }}" class="form-inline" style="gap:12px;margin-top:12px"
+        data-busy="Starting scheduler…">
+    <button class="btn btn-primary" type="submit"
+      {% if run.active %}disabled{% endif %}>Run due now</button>
+    <button class="btn btn-ghost" type="submit" name="dry" value="1"
+      {% if run.active %}disabled{% endif %}
+      data-busy="Listing due jobs…">Dry list</button>
+    {% if run.active %}
+    <span class="hint warn">Farm active - wait for finish or Stop.</span>
+    {% else %}
+    <span class="hint">Starts all due rows grouped by phone serial — 20 assigned phones run together. Watch Run Control phone monitors.</span>
+    {% endif %}
+  </form>
+  {% if run.active %}
+  <form method="post" action="{{ url_for('pages.run_stop') }}" class="form-inline" style="gap:12px;margin-top:10px"
+        data-busy="Stopping farm…">
+    <input type="hidden" name="next" value="schedule">
+    <button class="btn danger" type="submit">Stop run</button>
+  </form>
+  {% endif %}
+{% endcall %}
+
+{% call panel('Due now', 'PENDING ≤ NOW') %}
+  <div class="table-wrap">
+    <table class="data">
+      <thead>
+        <tr>
+          <th>Due</th><th>Username</th><th>Format</th><th>Link</th><th>Highlight</th><th>Caption</th><th>Status</th><th>Notes</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in sched.due %}
+        <tr>
+          <td class="mono">{{ r.due_at_iso or '-' }}</td>
+          <td>{{ r.username }}</td>
+          <td class="mono">{{ r.format }}</td>
+          <td class="muted">{{ (r.story_link or '')[:28] }}{% if r.story_link and r.story_link|length > 28 %}…{% endif %}{% if not r.story_link %}-{% endif %}</td>
+          <td class="mono">{{ r.highlight_title or '-' }}</td>
+          <td class="muted">{{ (r.caption or '')[:48] }}{% if r.caption and r.caption|length > 48 %}…{% endif %}</td>
+          <td>{{ r.status }}</td>
+          <td class="muted">{{ r.notes or '-' }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="8" class="muted">Nothing due yet - check Upcoming below, or wait for farm clock.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if due_total is defined %}
+  {{ pager('pages.schedule_page', due_page, due_pages, due_total, per_page, page_arg='due_page') }}
+  {% endif %}
+{% endcall %}
+
+{% call panel('Upcoming', 'PENDING > NOW') %}
+  <div class="table-wrap">
+    <table class="data">
+      <thead>
+        <tr>
+          <th>Due</th><th>Username</th><th>Format</th><th>Link</th><th>Highlight</th><th>Caption</th><th>Status</th><th>Notes</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in sched.upcoming %}
+        <tr>
+          <td class="mono">{{ r.due_at_iso or '-' }}</td>
+          <td>{{ r.username }}</td>
+          <td class="mono">{{ r.format }}</td>
+          <td class="muted">{{ (r.story_link or '')[:28] }}{% if r.story_link and r.story_link|length > 28 %}…{% endif %}{% if not r.story_link %}-{% endif %}</td>
+          <td class="mono">{{ r.highlight_title or '-' }}</td>
+          <td class="muted">{{ (r.caption or '')[:48] }}{% if r.caption and r.caption|length > 48 %}…{% endif %}</td>
+          <td>{{ r.status }}</td>
+          <td class="muted">{{ r.notes or '-' }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="8" class="muted">No upcoming rows - add pending jobs with a future due_at_iso.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if upcoming_total is defined %}
+  {{ pager('pages.schedule_page', upcoming_page, upcoming_pages, upcoming_total, per_page, page_arg='upcoming_page') }}
+  {% endif %}
+{% endcall %}
+
+{% call panel('Sticky IP', 'SAME ACCOUNT → SAME EXIT') %}
+  {% if sticky.error %}
+  <p class="muted">{{ sticky.error }}</p>
+  {% endif %}
+  <div class="table-wrap">
+    <table class="data">
+      <thead>
+        <tr><th>Username</th><th>Country</th><th>Session</th><th>Last exit</th><th>Updated</th></tr>
+      </thead>
+      <tbody>
+        {% for r in sticky.rows %}
+        <tr>
+          <td>{{ r.username }}</td>
+          <td>{{ r.country or '-' }}</td>
+          <td class="mono muted">{{ (r.session or '')[:18] }}{% if r.session|length > 18 %}…{% endif %}</td>
+          <td class="mono muted">{{ r.last_exit or '-' }}</td>
+          <td class="mono muted">{{ r.updated or '-' }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="5" class="muted">No sticky binds yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if sticky_total is defined %}
+  {{ pager('pages.schedule_page', sticky_page, sticky_pages, sticky_total, per_page, page_arg='sticky_page') }}
+  {% endif %}
+{% endcall %}
+
+{% call panel('Recent schedule outcomes', 'DONE / FAILED') %}
+  <div class="table-wrap">
+    <table class="data">
+      <thead>
+        <tr>
+          <th>Due</th><th>Username</th><th>Format</th><th>Status</th><th>Result</th><th>Serial</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in sched.recent %}
+        <tr>
+          <td class="mono">{{ r.due_at_iso or '-' }}</td>
+          <td>{{ r.username }}</td>
+          <td class="mono">{{ r.format }}</td>
+          <td>{{ r.status }}</td>
+          <td class="mono">{{ r.result or '-' }}</td>
+          <td class="mono muted">{{ r.serial or '-' }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="6" class="muted">No completed schedule rows yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if recent_total is defined %}
+  {{ pager('pages.schedule_page', recent_page, recent_pages, recent_total, per_page, page_arg='recent_page') }}
+  {% endif %}
+{% endcall %}
+{% endblock %}

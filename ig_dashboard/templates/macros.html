@@ -1,0 +1,102 @@
+{% macro badge(kind, text) -%}
+<span class="badge badge-{{ kind }}">{{ text }}</span>
+{%- endmacro %}
+
+{% macro login_badge(login) -%}
+{%- if login == 'LOGGED_IN' -%}
+{{ badge('ok', login) }}
+{%- elif login in ('NOT_RUN',) -%}
+{{ badge('mute', login) }}
+{%- elif login in ('ALL_IPS_MASKED', 'CAPTCHA', 'ACCOUNT_CHALLENGED', 'PROXY_DEAD') -%}
+{{ badge('warn', login) }}
+{%- else -%}
+{{ badge('bad', login) }}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro post_badge(post) -%}
+{%- if post == 'POST_DONE' -%}
+{{ badge('ok', post) }}
+{%- elif post in ('SKIPPED', 'NO_IMAGE', 'NOT_RUN') -%}
+{{ badge('mute', post) }}
+{%- else -%}
+{{ badge('warn', post) }}
+{%- endif -%}
+{%- endmacro %}
+
+{% macro mark_badge(mark) -%}
+{%- if (mark or '')|upper == 'RETRY' -%}
+{{ badge('retry', 'RETRY') }}
+{%- elif mark -%}
+{{ badge('mute', mark) }}
+{%- else -%}
+<span class="muted">—</span>
+{%- endif -%}
+{%- endmacro %}
+
+{% macro refresh_btn(label='Reload live data') -%}
+<button type="button" class="icon-btn" title="{{ label }}" aria-label="{{ label }}"
+        onclick="if(window.IGConsole&&IGConsole.reloadLive){IGConsole.reloadLive()}else{location.reload()}">
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+    <path d="M21 12a9 9 0 1 1-2.6-6.3" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+    <path d="M21 3v6h-6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+  </svg>
+</button>
+{%- endmacro %}
+
+{% macro panel(title, eyebrow='', extra_class='') -%}
+<section class="panel{% if extra_class %} {{ extra_class }}{% endif %}">
+  <header class="panel-head">
+    <div class="panel-head-text">
+      {% if eyebrow %}<span class="eyebrow">{{ eyebrow }}</span>{% endif %}
+      <h2>{{ title }}</h2>
+    </div>
+  </header>
+  <div class="panel-body">
+    {{ caller() }}
+  </div>
+</section>
+{%- endmacro %}
+
+{% macro stat(label, value, tone='') -%}
+<div class="stat {% if tone %}stat-{{ tone }}{% endif %}">
+  <div class="stat-value">{{ value }}</div>
+  <div class="stat-label">{{ label }}</div>
+</div>
+{%- endmacro %}
+
+{# Pagination bar. Preserves current query string; page_arg is the page query key.
+   Rows-per-page is customer-selectable: 10 / 25 / 50 / 100. #}
+{% macro pager(endpoint, page, pages_n, total=0, per_page=25, page_arg='page') -%}
+{% set start = ((page - 1) * per_page) + 1 if total else 0 %}
+{% set end = page * per_page if (page * per_page) < total else total %}
+{% set qs = request.args.to_dict(flat=True) %}
+<div class="pager">
+  <label class="pager-size">
+    <span class="muted">Rows</span>
+    <select class="pager-select" aria-label="Rows per page"
+            onchange="if(window.igSetPerPage){igSetPerPage(this)}else{this.form&&this.form.submit()}">
+      {% for n in [10, 25, 50, 100] %}
+      <option value="{{ n }}" {% if per_page|int == n %}selected{% endif %}>{{ n }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  {% if page > 1 %}
+  {% set _ = qs.update({page_arg: page - 1, 'per_page': per_page}) %}
+  <a class="btn btn-ghost" href="{{ url_for(endpoint, **qs) }}">← Prev</a>
+  {% else %}
+  <span class="btn btn-ghost is-disabled" aria-disabled="true">← Prev</span>
+  {% endif %}
+  <span class="pager-meta muted">
+    Page {{ page }} / {{ pages_n }}
+    {% if total %}· {{ start }}-{{ end }} of {{ total }}{% endif %}
+  </span>
+  {% if page < pages_n %}
+  {% set qs2 = request.args.to_dict(flat=True) %}
+  {% set _ = qs2.update({page_arg: page + 1, 'per_page': per_page}) %}
+  <a class="btn btn-ghost" href="{{ url_for(endpoint, **qs2) }}">Next →</a>
+  {% else %}
+  <span class="btn btn-ghost is-disabled" aria-disabled="true">Next →</span>
+  {% endif %}
+</div>
+{%- endmacro %}

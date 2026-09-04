@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}IG Console{% endblock %} · IG Farm</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Exo+2:wght@400;500;600;700&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/console.css') }}?v=20260824b">
+</head>
+<body>
+  <div id="nav-progress" class="nav-progress" aria-hidden="true"><span></span></div>
+  <div class="atmosphere" aria-hidden="true"></div>
+  <div class="grid-overlay" aria-hidden="true"></div>
+
+  <div id="busy-overlay" class="busy-overlay" hidden aria-live="polite" aria-busy="true">
+    <div class="busy-card">
+      <div class="busy-spinner" aria-hidden="true"></div>
+      <div class="busy-label" id="busy-label">Working…</div>
+      <p class="busy-hint">Please wait. Talking to Sheet / farm.</p>
+    </div>
+  </div>
+
+  <div class="shell">
+    <aside class="rail">
+      <div class="brand">
+        <div class="brand-mark"></div>
+        <div>
+          <div class="brand-name">IG CONSOLE</div>
+          <div class="brand-sub">AIRSPACE OPS</div>
+        </div>
+      </div>
+
+      <nav class="nav">
+        <a class="nav-link {% if nav.active == 'overview' %}is-active{% endif %}" href="{{ url_for('pages.overview') }}">Overview</a>
+        <a class="nav-link {% if nav.active == 'phones' %}is-active{% endif %}" href="{{ url_for('pages.phones_page') }}">Fleet Screens</a>
+        <a class="nav-link {% if nav.active == 'run' %}is-active{% endif %}" href="{{ url_for('pages.run_page') }}">Run Control</a>
+        <a class="nav-link {% if nav.active == 'schedule' %}is-active{% endif %}" href="{{ url_for('pages.schedule_page') }}">Schedule</a>
+        <a class="nav-link {% if nav.active == 'lines' %}is-active{% endif %}" href="{{ url_for('pages.lines_page') }}">Lines & Warm-up</a>
+        <a class="nav-link {% if nav.active == 'content' %}is-active{% endif %}" href="{{ url_for('pages.content') }}">Content</a>
+        <a class="nav-link {% if nav.active == 'history' %}is-active{% endif %}" href="{{ url_for('pages.history') }}">Try History</a>
+        <a class="nav-link {% if nav.active == 'accounts' %}is-active{% endif %}" href="{{ url_for('pages.accounts') }}">Accounts</a>
+        <a class="nav-link {% if nav.active == 'binds' %}is-active{% endif %}" href="{{ url_for('pages.binds_page') }}">Binds</a>
+      </nav>
+
+      <div class="rail-foot">
+        <div class="run-pill run-{{ nav.run_label|lower }}">
+          <span class="run-dot"></span>
+          {{ nav.run_label }}
+        </div>
+        {% if nav.proxy is defined %}
+        <div class="run-pill {% if nav.proxy.ok %}proxy-up{% else %}proxy-down{% endif %}" title="{{ nav.proxy.detail }}">
+          <span class="run-dot"></span>
+          {{ nav.proxy.label }}
+        </div>
+        {% endif %}
+        <div class="rail-meta">port 3001 · Start posting here</div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <header class="topbar">
+        <div>
+          <h1 class="page-title">{% block page_title %}Overview{% endblock %}</h1>
+          <p class="page-sub">{% block page_sub %}Instagram farm control plane{% endblock %}</p>
+        </div>
+        <div class="topbar-actions">
+          {% block top_actions %}{% endblock %}
+          {% from "macros.html" import refresh_btn %}
+          {{ refresh_btn('Reload page data from Sheet / farm files') }}
+        </div>
+      </header>
+
+      <div class="main-scroll">
+      {% if nav.proxy is defined and not nav.proxy.ok %}
+      <div class="alert-banner" role="alert">
+        <div class="alert-title">Proxy pool offline</div>
+        <p>{{ nav.proxy.msg }}</p>
+        <p class="alert-meta">{{ nav.proxy.detail }} · run <code>start_proxy_pool.bat</code></p>
+      </div>
+      {% endif %}
+
+      {% if msg is defined and msg %}
+      <div class="toast {% if ok == '1' %}toast-ok{% else %}toast-bad{% endif %}">{{ msg }}</div>
+      {% endif %}
+
+      {% block body %}{% endblock %}
+      </div>
+    </main>
+  </div>
+
+  {% block overlay %}{% endblock %}
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script src="{{ url_for('static', filename='js/console.js') }}?v=20260824b"></script>
+  <script src="{{ url_for('static', filename='js/analytics.js') }}?v=20260813a"></script>
+  {% block scripts %}{% endblock %}
+</body>
+</html>

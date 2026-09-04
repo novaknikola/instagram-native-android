@@ -1,0 +1,71 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Secrets and accounts — never commit
+.env
+.env.*
+*_key.txt
+*apikey.txt
+grok_key.txt
+service_account.json
+dashboard_password.txt
+floppydata_proxy.json
+farm_accounts.csv
+Instagram_farm_accounts.csv
+alive_accounts_credentials.csv
+*.session
+
+# Runtime / local state
+ig_console_run.json
+ig_batch_results.csv
+batch_results.csv
+post_results.csv
+ig_post_results.csv
+ig_sticky_ip.json
+ig_content_lines.json
+ig_account_status.json
+ig_account_clone.json
+ig_account_drive_map.json
+ig_phone_drive_map.json
+ig_phones_drive_folder.txt
+ig_schedule.csv
+ig_shared_drive_folder.txt
+ig_reels_folder.txt
+ig_story_link.txt
+ig_warmup_profiles.txt
+ig_clones_drive_folder.txt
+ig_debug_*.ndjson
+ig_reel_trace.jsonl
+*.bak*
+ig_loop.py.bak*
+logs/
+dumps/
+shots/
+phone_shots/
+per device recordings/
+proxy_state/
+content/
+used_ig_accounts/
+used_*.txt
+used_ig_*.txt
+*.log
+*.png
+*.jpg
+*.mp4
+monitor_state.db
+_tmp_*/
+scripts/_live*.py
+_live_dump.py
+_verify_post.py
+
+# Large binaries / Nomix APKs (install separately)
+nomix_api/downloaded_ig/
+*.apk
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini

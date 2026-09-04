@@ -1,0 +1,160 @@
+{% extends "base.html" %}
+{% from "macros.html" import panel, login_badge, post_badge, mark_badge, stat, pager %}
+
+{% block title %}History{% endblock %}
+{% block page_title %}Try History{% endblock %}
+{% block page_sub %}ig_batch_results.csv - every login / post attempt{% endblock %}
+
+{% block body %}
+<section class="stat-row">
+  {{ stat('Attempts', summary.total_attempts) }}
+  {{ stat('POST_DONE', summary.post_done, 'ok') }}
+  {{ stat('LOGGED_IN', summary.logged_in) }}
+  {{ stat('ALL_IPS_MASKED', summary.captcha_masked, 'warn') }}
+  {{ stat('NOT_FOUND', summary.not_found, 'bad') }}
+</section>
+
+{% if summary.format_counts %}
+<section class="stat-row">
+  {% for fmt, n in summary.format_counts.items() %}
+  {{ stat(fmt, n) }}
+  {% endfor %}
+</section>
+{% endif %}
+
+{% call panel('Analytics', '14-DAY BI') %}
+  <section class="stat-row">
+    <div class="stat">
+      <div class="stat-value" id="an-attempts">—</div>
+      <div class="stat-label">Attempts</div>
+    </div>
+    <div class="stat stat-ok">
+      <div class="stat-value" id="an-post-done">—</div>
+      <div class="stat-label">POST_DONE</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value" id="an-success-rate">—</div>
+      <div class="stat-label">Success rate</div>
+    </div>
+    <div class="stat">
+      <div class="stat-value" id="an-days">14d</div>
+      <div class="stat-label">Window</div>
+    </div>
+  </section>
+  <div class="analytics-grid">
+    <div class="analytics-card is-wide">
+      <p class="analytics-card-title">Daily attempts · POST_DONE (hover for success %)</p>
+      <div class="analytics-canvas-wrap" id="analytics-line-wrap">
+        <canvas id="chart-daily" aria-label="Daily attempts and POST_DONE"></canvas>
+      </div>
+    </div>
+  </div>
+  <div class="analytics-grid analytics-grid-3">
+    <div class="analytics-card">
+      <p class="analytics-card-title">Post outcomes</p>
+      <div class="analytics-canvas-wrap" id="analytics-post-wrap">
+        <canvas id="chart-post" aria-label="Post outcome mix"></canvas>
+      </div>
+    </div>
+    <div class="analytics-card">
+      <p class="analytics-card-title">Login outcomes</p>
+      <div class="analytics-canvas-wrap" id="analytics-login-wrap">
+        <canvas id="chart-login" aria-label="Login outcome mix"></canvas>
+      </div>
+    </div>
+    <div class="analytics-card">
+      <p class="analytics-card-title">Format mix</p>
+      <div class="analytics-canvas-wrap" id="analytics-format-wrap">
+        <canvas id="chart-format" aria-label="Format mix"></canvas>
+      </div>
+    </div>
+  </div>
+{% endcall %}
+
+{% call panel('Filters', 'QUERY') %}
+  <form method="get" class="form-inline">
+    <input type="hidden" name="per_page" value="{{ per_page|default(25) }}">
+    <label>
+      <span>Login</span>
+      <select name="login">
+        <option value="">any</option>
+        {% for opt in ['LOGGED_IN','ALL_IPS_MASKED','ACCOUNT_NOT_FOUND','ACCOUNT_CHALLENGED','PROXY_DEAD','APP_WONT_OPEN','LOGIN_META_ERROR'] %}
+        <option value="{{ opt }}" {% if login == opt %}selected{% endif %}>{{ opt }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      <span>Post</span>
+      <select name="post">
+        <option value="">any</option>
+        {% for opt in ['POST_DONE','SKIPPED','NO_IMAGE','POST_TIMEOUT','POST_CAPTCHA','POST_BLOCKED','POST_RATE_LIMIT'] %}
+        <option value="{{ opt }}" {% if post == opt %}selected{% endif %}>{{ opt }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      <span>Format</span>
+      <select name="format">
+        <option value="">any</option>
+        {% for opt in ['feed','story','carousel','reel'] %}
+        <option value="{{ opt }}" {% if fmt == opt %}selected{% endif %}>{{ opt }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label>
+      <span>Mark</span>
+      <select name="mark">
+        <option value="">any</option>
+        <option value="RETRY" {% if mark == 'RETRY' %}selected{% endif %}>RETRY</option>
+      </select>
+    </label>
+    <button class="btn btn-primary" type="submit">Apply</button>
+    <a class="btn btn-ghost" href="{{ url_for('pages.history') }}">Clear</a>
+  </form>
+{% endcall %}
+
+{% call panel('Results', 'LEDGER') %}
+  <div class="table-wrap">
+    <table class="data">
+      <thead>
+        <tr>
+          <th>Time</th><th>Username</th><th>Format</th><th>Mark</th><th>Serial</th><th>Clone</th>
+          <th>CC</th><th>Exit IP</th><th>Login</th><th>Post</th><th>Link</th><th>HL</th><th>Image</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in rows %}
+        <tr>
+          <td class="mono">{{ r.time }}</td>
+          <td>{{ r.username }}</td>
+          <td class="mono">{{ r.format or 'feed' }}</td>
+          <td>{{ mark_badge(r.mark) }}</td>
+          <td class="mono muted">{{ r.serial }}</td>
+          <td class="mono">{{ r.clone.replace('com.instagram.', '') if r.clone else '-' }}</td>
+          <td>{{ r.country }}</td>
+          <td class="mono muted">{{ r.exit_ip or '-' }}</td>
+          <td>{{ login_badge(r.login) }}</td>
+          <td>{{ post_badge(r.post) }}</td>
+          <td class="mono muted">{% if r.link_ok == '1' %}ok{% elif r.link_ok == '0' %}miss{% else %}{{ (r.story_link or '-')[:16] }}{% endif %}</td>
+          <td class="mono muted">{% if r.highlight_ok == '1' %}ok{% elif r.highlight_ok == '0' %}miss{% else %}-{% endif %}</td>
+          <td class="muted">{{ r.image or '-' }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="13" class="muted">No matching rows.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if total is defined %}
+  {{ pager('pages.history', page, pages_n, total, per_page) }}
+  {% endif %}
+{% endcall %}
+{% endblock %}
+
+{% block scripts %}
+<script>
+  if (window.IGAnalytics) {
+    IGAnalytics.bindHistoryAnalytics({ days: 14 });
+  }
+</script>
+{% endblock %}

@@ -1,0 +1,4 @@
+# IG warm-up target profiles (one Instagram username per line)
+# Used by ig_warmup.py / dashboard Lines & Warm-up page
+# nike
+# adidas
