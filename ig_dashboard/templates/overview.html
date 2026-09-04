@@ -1,0 +1,176 @@
+{% extends "base.html" %}
+{% from "macros.html" import panel, stat, login_badge, post_badge, pager %}
+
+{% block title %}Overview{% endblock %}
+{% block page_title %}Mission Overview{% endblock %}
+{% block page_sub %}Fleet · ledger · pool at a glance{% endblock %}
+
+{% block top_actions %}
+<button type="button" class="btn" id="btn-clone-map">Phone map</button>
+<a class="btn btn-primary" href="{{ url_for('pages.run_page') }}">Open Run Control</a>
+{% endblock %}
+
+{% block body %}
+{% if health is defined and health.blockers %}
+<div class="alert-banner" role="alert">
+  <div class="alert-title">Not ready to post</div>
+  {% for b in health.blockers %}
+  <p>{{ b }}</p>
+  {% endfor %}
+</div>
+{% elif health is defined and health.warnings %}
+<div class="alert-banner alert-warn" role="status">
+  <div class="alert-title">Warnings</div>
+  {% for w in health.warnings %}
+  <p>{{ w }}</p>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if health is defined and health.checks %}
+{% call panel('System readiness', 'INDEPENDENT CHECKS') %}
+  <div class="chips">
+    {% for c in health.checks %}
+    <div class="chip {% if c.ok %}chip-ok{% else %}chip-bad{% endif %}">
+      <span>{{ c.label }}</span><b>{{ 'OK' if c.ok else 'FAIL' }}</b>
+    </div>
+    {% endfor %}
+  </div>
+{% endcall %}
+{% endif %}
+
+<section class="stat-row">
+  {{ stat('Run', run.label, 'live' if run.active else '') }}
+  {{ stat('Phones', fleet.phones) }}
+  {{ stat('Ready phones', fleet.ready) }}
+  {{ stat('Native IG', fleet.unique_clones|default(0)) }}
+  {% if fleet.allowlist_on %}
+  {{ stat('OPEN_OK', fleet.open_ok_clones|default(0), 'ok') }}
+  {{ stat('Ignored', fleet.ignored_clones|default(0), 'warn' if fleet.ignored_clones else '') }}
+  {% endif %}
+  {{ stat('POST_DONE', ledger.post_done, 'ok') }}
+  {{ stat('Attempts', ledger.total_attempts) }}
+</section>
+<p class="clone-map-hint muted">
+  Ready phones = Play Store Instagram installed.
+  <button type="button" class="link-btn" id="btn-clone-map-inline">See per-phone map</button>
+</p>
+
+{% if fleet.error %}
+<div class="toast toast-bad">ADB: {{ fleet.error }}</div>
+{% endif %}
+{% if pool.error %}
+<div class="toast toast-bad">Accounts: {{ pool.error }}</div>
+{% endif %}
+
+<div class="layout-2">
+  {% call panel('Fleet inventory', 'DEVICES') %}
+    {% if not fleet.devices %}
+      <p class="muted">No ADB devices detected. Connect phones on the Windows host.</p>
+    {% else %}
+      <div class="table-wrap">
+        <table class="data">
+          <thead>
+            <tr><th>Serial</th><th>Unique IG</th><th>Shared (skipped)</th><th>State</th></tr>
+          </thead>
+          <tbody>
+            {% for d in fleet.devices %}
+            <tr>
+              <td class="mono">{{ d.serial }}</td>
+              <td><b>{{ d.unique|length }}</b>
+                <span class="muted">{% if d.unique %}{{ d.unique|map('replace', 'com.instagram.', '')|join(', ') }}{% endif %}</span>
+              </td>
+              <td class="muted">{% if d.shared %}{{ d.shared|map('replace', 'com.instagram.', '')|join(', ') }}{% else %}-{% endif %}</td>
+              <td>
+                {% if d.error %}<span class="badge badge-bad">ERR</span>
+                {% elif d.ready %}<span class="badge badge-ok">READY</span>
+                {% else %}<span class="badge badge-warn">NO UNIQUE</span>{% endif %}
+              </td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% if dev_total is defined %}
+      {{ pager('pages.overview', dev_page, dev_pages, dev_total, per_page, page_arg='dev_page') }}
+      {% endif %}
+    {% endif %}
+  {% endcall %}
+
+  {% call panel('Ledger mix', 'OUTCOMES') %}
+    <div class="chips">
+      {% for k, v in ledger.login_counts.items() %}
+      <div class="chip"><span>{{ k }}</span><b>{{ v }}</b></div>
+      {% else %}
+      <p class="muted">No IG results yet - run a batch first.</p>
+      {% endfor %}
+    </div>
+    <div class="divider"></div>
+    <div class="chips">
+      {% for k, v in ledger.post_counts.items() %}
+      <div class="chip chip-post"><span>{{ k }}</span><b>{{ v }}</b></div>
+      {% endfor %}
+    </div>
+  {% endcall %}
+</div>
+
+{% call panel('Recent try history', 'ig_batch_results.csv') %}
+  <div class="table-wrap">
+    <table class="data">
+      <thead>
+        <tr><th>Time</th><th>User</th><th>Format</th><th>Model phone</th><th>Login</th><th>Post</th><th>Image</th></tr>
+      </thead>
+      <tbody>
+        {% for r in recent %}
+        <tr>
+          <td class="mono">{{ r.time }}</td>
+          <td>{{ r.username }}</td>
+          <td class="mono">{{ r.format or 'feed' }}</td>
+          <td class="mono muted">{{ r.serial[-8:] if r.serial else '-' }}</td>
+          <td>{{ login_badge(r.login) }}</td>
+          <td>{{ post_badge(r.post) }}</td>
+          <td class="muted">{{ r.image or '-' }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="7" class="muted">No rows yet.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if recent_total is defined %}
+  {{ pager('pages.overview', recent_page, recent_pages, recent_total, per_page, page_arg='recent_page') }}
+  {% endif %}
+  <div class="panel-foot">
+    <a class="link" href="{{ url_for('pages.history') }}">Full history →</a>
+  </div>
+{% endcall %}
+{% endblock %}
+
+{% block overlay %}
+<div class="screens-lightbox" id="clone-map-modal" hidden role="dialog" aria-modal="true"
+     aria-labelledby="clone-map-title">
+  <div class="viewer-shell clone-map-shell">
+    <div class="viewer-top">
+      <div>
+        <span class="viewer-kicker">FLEET · UNIQUE IG</span>
+        <h2 class="viewer-title" id="clone-map-title">Clone map</h2>
+      </div>
+      <div class="viewer-top-right">
+        <button type="button" class="btn btn-ghost" id="clone-map-refresh">Refresh</button>
+        <button type="button" class="btn" id="clone-map-close" aria-label="Close">Close</button>
+      </div>
+    </div>
+    <div class="clone-map-body" id="clone-map-body">
+      <p class="muted">Loading phones…</p>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+  if (window.IGConsole && IGConsole.bindCloneMap) {
+    IGConsole.bindCloneMap("{{ url_for('api.api_fleet_clones') }}");
+  }
+</script>
+{% endblock %}

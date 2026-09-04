@@ -1,0 +1,53 @@
+{% extends "base.html" %}
+{% from "macros.html" import panel, stat, pager, badge %}
+
+{% block title %}Binds{% endblock %}
+{% block page_title %}Nalog · telefon · IP{% endblock %}
+{% block page_sub %}Jedan nalog, jedan telefon, native Instagram, sticky session.{% endblock %}
+
+{% block body %}
+<section class="stat-row">
+  {{ stat('Binds', snap.count) }}
+  {{ stat('Farm OK', snap.farm_ok, 'ok') }}
+  {{ stat('NO_PHONE', snap.skipped, 'warn' if snap.skipped else '') }}
+  {{ stat('Unbound', snap.unbound) }}
+</section>
+<p class="muted">Native farm — bind je nalog ↔ serial. Leftover Nomix klonovi se ignorišu.</p>
+{% if snap.error %}
+<div class="toast toast-bad">{{ snap.error }}</div>
+{% endif %}
+
+{% call panel('Identity', 'ACCOUNT = PHONE = STICKY') %}
+  <div class="table-wrap">
+    <table class="data">
+      <thead>
+        <tr>
+          <th>Username</th><th>Model</th><th>Status</th><th>Serial</th>
+          <th>Clone</th><th>CC</th><th>Session</th><th>Last exit</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in rows %}
+        <tr>
+          <td>{{ r.username }}</td>
+          <td>{{ r.model or '-' }}</td>
+          <td>
+            {% if r.status == 'FARM_OK' %}{{ badge('ok', 'FARM_OK') }}
+            {% elif r.status == 'NO_PHONE' %}{{ badge('warn', 'NO_PHONE') }}
+            {% else %}{{ badge('mute', 'UNBOUND') }}{% endif %}
+          </td>
+          <td class="mono muted">{{ r.serial[-10:] if r.serial|length > 10 else (r.serial or '-') }}</td>
+          <td class="mono">{{ r.clone or '-' }}</td>
+          <td>{{ r.country or '-' }}</td>
+          <td class="mono muted">{{ (r.session or '')[:18] }}{% if r.session|length > 18 %}…{% endif %}</td>
+          <td class="mono muted">{{ r.last_exit or '-' }}</td>
+        </tr>
+        {% else %}
+        <tr><td colspan="8" class="muted">Nema bindova ni naloga.</td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {{ pager('pages.binds_page', page, pages_n, total, per_page) }}
+{% endcall %}
+{% endblock %}
