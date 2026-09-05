@@ -4560,23 +4560,30 @@ def _dismiss_clips_nux(xml=None):
     return False
 
 
-def _poll_reel_nux_after_share(fmt="reel", waits=3, pause=0.4):
+def _poll_reel_nux_after_share(fmt="reel", waits=8, pause=0.5, grace=3):
     """After caption Share, peek for About Reels NUX — do not sit on New reel.
 
-    If dump is still write-a-caption with no NUX sheet, return immediately.
-    Old waits=10 + dump timeout=8 burned ~10min on Nylah while Next missed.
+    First-reel bug (Nylah/Dalia 2026-09-02): on an empty profile the About Reels
+    NUX arrives ~1–2s AFTER the caption Share tap. The old code bailed on the very
+    first poll ("still caption, no NUX — skip wait"), i.e. before the sheet could
+    render, so its Share (the real publish confirm) was never tapped → POST_TIMEOUT
+    on an empty grid. Give the NUX a short GRACE (a few caption-only reads) to
+    appear before giving up. Bounded by `waits` and _section_expired so this can
+    never re-create the old ~10min sit (that came from waits=10 + dump timeout=8).
     """
     fmt = (fmt or "reel").lower()
+    caption_only = 0
     for i in range(max(1, int(waits))):
+        if _section_expired(need=1.5):
+            print("[pub] NUX poll — composer budget, stop i=%d" % i)
+            return False
         xml = dump(timeout=5, attempts=1)
         if _publish_succeeded(xml, fmt=fmt) or not _still_in_composer(xml, fmt=fmt):
             print("[pub] left composer during NUX wait i=%d" % i)
             return True
         nux = _is_clips_nux_sheet(xml)
-        if _is_caption_composer(xml) and not nux:
-            print("[pub] still caption, no NUX sheet — skip wait")
-            return False
         if nux:
+            caption_only = 0
             if _dismiss_clips_nux(xml) and getattr(_dismiss_clips_nux, "shared", False):
                 time.sleep(1.2)
                 xml_ok = dump(timeout=5, attempts=1)
@@ -4587,6 +4594,13 @@ def _poll_reel_nux_after_share(fmt="reel", waits=3, pause=0.4):
                 print("[pub] NUX Share tapped — still in composer i=%d" % i)
             else:
                 print("[pub] NUX sheet seen but Share miss i=%d" % i)
+        elif _is_caption_composer(xml):
+            # NUX not up yet — wait a few frames before quitting (it lags Share).
+            caption_only += 1
+            if caption_only >= max(1, int(grace)):
+                print("[pub] still caption, no NUX after %d reads — skip wait"
+                      % caption_only)
+                return False
         time.sleep(pause)
     print("[pub] NUX wait exhausted still in composer")
     return False
@@ -10389,6 +10403,13 @@ def _do_post_body(caption=CAPTION, image_path=None, username="", pkg=None,
         if st in ("HUMAN_CHECK", "CAPTCHA", "CONTACT_VERIFY", "CHALLENGE"):
             print("[post] after share gated by %s" % st)
             return emit_fail("POST_CAPTCHA" if st != "CONTACT_VERIFY" else "POST_BLOCKED")
+        # First-reel About Reels NUX can surface AFTER Share — its Share is the
+        # real publish confirm. Handle it here too, not only inside publish loop.
+        if fmt == "reel" and _is_clips_nux_sheet(xml):
+            print("[post] About Reels NUX after share — confirm")
+            _dismiss_clips_nux(xml)
+            time.sleep(1.2)
+            continue
         if _dismiss_giphy_overlay(xml):
             time.sleep(0.4)
             continue
