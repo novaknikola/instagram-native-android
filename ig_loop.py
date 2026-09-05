@@ -9865,25 +9865,66 @@ def peek_own_post_live(username="", prefer_reels=False):
     return True
 
 
+def _desc_is_live_story_ring(d, u=""):
+    """True ONLY for a live own-story ring — never the empty 'Add to story' affordance.
+
+    The add-story button is always present and its desc ('Add to your story')
+    contains the substring 'your story', so the old check matched it and reported
+    every story as live. Exclude the add affordance BEFORE matching, then accept a
+    real live signal: 'Your story', "<username>'s story", or a seen-count ('0 of N'
+    / 'unseen'). Mirrors _open_own_story_view, which already excludes the affordance.
+    """
+    d = (d or "").strip().lower()
+    u = (u or "").strip().lower()
+    if not d or "story" not in d:
+        return False
+    # Empty affordance and non-story chrome — never a live ring
+    if "add to story" in d or "add to your story" in d or "add story" in d:
+        return False
+    if "highlight" in d or "close friends" in d or "create" in d:
+        return False
+    if d.endswith("'s story") or (u and ("%s's story" % u) in d):
+        return True
+    if "your story" in d:
+        return True
+    # Story tray/viewer seen-count only renders when a story actually exists
+    if re.search(r"\b0 of \d", d) or "unseen" in d or "new items" in d:
+        return True
+    return False
+
+
 def verify_story_live(username=""):
-    """Confirm own profile shows a story ring. Fail-closed — no soft POST_DONE."""
+    """Confirm own profile shows a LIVE story ring. Fail-closed — no soft POST_DONE.
+
+    The empty 'Add to story' affordance is always on-screen and its desc contains
+    the substring 'your story' — the old check matched it (and a bare tb 'your
+    story') and reported every story as live. Require a *clickable* ring whose desc
+    is a genuine live-story signal (see _desc_is_live_story_ring) and bail on any
+    block state, so we only return POST_DONE when the story is actually live.
+    """
     time.sleep(4)
+    u = (username or "").strip().lower()
     if not _escape_to_profile():
         print("[post] story verify — profile unreachable")
         return emit_fail("POST_BLOCKED", note="story_profile_missing")
     time.sleep(2.5)
     for _ in range(6):
         xml = dump()
-        tb = text_block(xml)
-        u = (username or "").strip().lower()
+        st = detect_state(xml)
+        if st in ("ACCOUNT_SUSPENDED", "CHALLENGE", "CAPTCHA", "HUMAN_CHECK",
+                  "CONTACT_VERIFY", "ACTION_LIMIT"):
+            print("[post] story verify blocked by %s -> NOT live" % st)
+            if st == "ACTION_LIMIT":
+                return fail_action_limit("story_verify")
+            return emit_fail("POST_CAPTCHA" if st in ("CAPTCHA", "HUMAN_CHECK")
+                             else "POST_BLOCKED")
         for n in nodes(xml):
+            if attr(n, "clickable") != "true":
+                continue
             d = attr(n, "content-desc").lower()
-            if "story" in d and (not u or u in d or "your story" in d or "0 of" in d):
-                print("[OK] STORY_LIVE (story ring/desc): %s" % d[:60])
+            if _desc_is_live_story_ring(d, u):
+                print("[OK] STORY_LIVE (story ring): %s" % d[:60])
                 return "POST_DONE"
-        if "your story" in tb.lower():
-            print("[OK] STORY_LIVE (Your story text)")
-            return "POST_DONE"
         time.sleep(2.0)
         if not _escape_to_profile():
             break
@@ -10273,11 +10314,13 @@ def _do_post_body(caption=CAPTION, image_path=None, username="", pkg=None,
                 LAST_POST_META["highlight_ok"] = "0"
                 print("[FAIL] story highlight exception: %s" % e)
                 return emit_fail("STORY_HIGHLIGHT_FAIL", note=str(e)[:80])
+        # Trust the fail-closed verifier: only POST_DONE if the story is truly live.
+        # (Old code returned soft POST_DONE here, marking un-posted stories as done.)
         live = verify_story_live(username)
-        if live == "POST_DONE":
-            return live
-        print("[post] story share OK — verify inconclusive, POST_DONE (soft)")
-        return "POST_DONE"
+        if live != "POST_DONE":
+            print("[FAIL] story share left editor but story not confirmed live (%s)"
+                  % live)
+        return live
 
     adb("shell", "ime", "enable", "com.android.adbkeyboard/.AdbIME")
     adb("shell", "ime", "set", "com.android.adbkeyboard/.AdbIME")
