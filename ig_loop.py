@@ -4118,15 +4118,56 @@ def tap_share_btn(xml):
 ADB_IME = "com.android.adbkeyboard/.AdbIME"
 
 
-def _adb_ime_off():
-    """AdbIME {ON} bar sits on the footer and eats Next/Share taps.
+def _ime_shown():
+    """True if a soft keyboard is currently visible over the UI.
 
-    Nylah 2026-09-02 POST_TIMEOUT: visible CTA was blue Next; XML share_button
-    @ 1068,2762 hit the ADB Keyboard strip instead of publishing.
+    The publish footer (Share/Next @ ~y2762 on Note 8) sits under the keyboard;
+    while a keyboard is shown a footer tap lands on a keyboard key instead
+    (Nylah/Gboard 2026-09-02: Enter @ y2644 stole the tap). uiautomator XML does
+    NOT expose the IME window, so dumpsys is the only authoritative signal.
+    Fail-open (return False) if the state can't be read — callers then behave as
+    before rather than block.
+    """
+    try:
+        out = adb("shell", "dumpsys", "input_method") or ""
+    except Exception:
+        return False
+    m = re.search(r"mInputShown=(\w+)", out)
+    if m:
+        return m.group(1) == "true"
+    if "isInputViewShown=true" in out or "mViewVisible=true" in out:
+        return True
+    return False
+
+
+def _adb_ime_off():
+    """Force any soft keyboard OFF the footer, then VERIFY it is actually gone.
+
+    AdbIME {ON} bar sits on the footer and eats Next/Share taps (Nylah
+    2026-09-02 POST_TIMEOUT: visible CTA was blue Next; XML share_button @1068,2762
+    hit the ADB Keyboard strip). Disabling the ADB IME can hand focus to Gboard,
+    which ALSO covers the footer (fail shot: Gboard Enter @2644 stole the tap).
+    Fire-and-forget ESCAPE was not enough — poll mInputShown and escalate until the
+    keyboard is confirmed down. Returns True once no IME is shown.
     """
     adb("shell", "ime", "disable", ADB_IME)
-    adb("shell", "input", "keyevent", "KEYCODE_ESCAPE")
-    time.sleep(0.3)
+    for _ in range(5):
+        if not _ime_shown():
+            time.sleep(0.1)
+            return True
+        adb("shell", "input", "keyevent", "KEYCODE_ESCAPE")
+        time.sleep(0.2)
+        # Re-verify immediately before BACK so we only ever BACK a *shown* IME —
+        # a visible keyboard consumes BACK to hide itself and does NOT navigate,
+        # so this can't Back out of the composer (runbook's "don't Back the editor"
+        # only applies when the IME is already down).
+        if _ime_shown():
+            adb("shell", "input", "keyevent", "KEYCODE_BACK")
+            time.sleep(0.3)
+    if _ime_shown():
+        print("[ime] keyboard still shown after escalation — footer tap may miss")
+        return False
+    return True
 
 
 def _tap_caption_footer_next(xml=None):
@@ -6311,6 +6352,12 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
         # 1) share_footer / share_button / Share.
         # Caption OK already handled above — never rank top bar as publish.
         # Landscape top Share still reachable via _tap_share_button_any.
+        # Keyboard must be OFF the footer or the CTA tap lands on a key
+        # (Nylah/Gboard 2026-09-02). Verify + re-dump so coords are the real CTA.
+        if fmt_key in ("reel", "feed") and _ime_shown():
+            _adb_ime_off()
+            time.sleep(0.2)
+            xml = dump()
         _allow_top = False
         _cands = _find_publish_nodes(xml, fmt=fmt_key, allow_top_share=_allow_top)
         # #region agent log
