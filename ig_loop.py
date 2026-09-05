@@ -4213,11 +4213,26 @@ def _hide_ime(xml=None):
     kadriye/kub.ra 2026-08-10: tap(40,1500) on New post hit Add audio / Tag people
     → sheets over Share → POST_TIMEOUT with Share still visible.
     On caption chrome, unfocus on media-preview left only.
+
+    Stories: NEVER mid-canvas / mid-left tap. That focuses Aa / "add a caption…"
+    so the keyboard shows with an empty cursor and nothing types (stories do not
+    call _apply_caption). Collapse via IME disable + ESC/BACK only.
     """
     adb("shell", "input", "keyevent", "KEYCODE_ESCAPE")
     time.sleep(0.15)
     xml = xml if xml is not None else dump()
     tb = text_block(xml).lower()
+    story_canvas = (
+        _is_story_text_tool(xml, tb)
+        or _is_story_editor_chrome(xml, tb)
+        or any(p in tb for p in (
+            "your story", "add to your story", "share to story", "close friends",
+            "modern text style", "classic text style", "signature text style"))
+        or ("stickers" in tb and "done" in tb and "gallery" not in tb)
+    )
+    if story_canvas:
+        _adb_ime_off()
+        return
     sw, sh = _screen_wh(xml)
     if any(p in tb for p in (
             "add a caption", "write a caption", "also share on", "tag people",
@@ -4332,6 +4347,9 @@ def _publish_succeeded(xml=None, fmt="reel"):
                                "your reel has been shared", "your post has been shared",
                                "reel has been shared", "post has been shared",
                                "story has been shared", "shared to your story")):
+        return True
+    if fmt == "story" and _is_stories_archive_nux(xml, tbl):
+        # Share already accepted — archive intro is post-publish chrome.
         return True
     st = detect_state(xml)
     if st in ("HUMAN_CHECK", "CAPTCHA", "CONTACT_VERIFY", "CHALLENGE"):
@@ -4611,13 +4629,28 @@ def _poll_reel_nux_after_share(fmt="reel", waits=8, pause=0.5, grace=3):
     on an empty grid. Give the NUX a short GRACE (a few caption-only reads) to
     appear before giving up. Bounded by `waits` and _section_expired so this can
     never re-create the old ~10min sit (that came from waits=10 + dump timeout=8).
+
+    Dalia 2026-09-05: composer budget was already dead (97s/60s) when
+    clips_nux_share was tapped — poll stopped at i=0 even though NUX had been
+    on screen. Always grant a short fresh window at poll entry.
     """
     fmt = (fmt or "reel").lower()
+    # Fresh window for delayed About Reels (budget often burned on OK+Share).
+    if _SECTION is not None and _section_left() < 8:
+        _section_begin("composer", 35)
+        print("[pub] NUX poll — composer budget refreshed 35s")
     caption_only = 0
     for i in range(max(1, int(waits))):
         if _section_expired(need=1.5):
-            print("[pub] NUX poll — composer budget, stop i=%d" % i)
-            return False
+            # Budget often expires mid-Share while About Reels is already up
+            # (Dalia 2026-09-05: stop i=0 with clips_nux_share still on screen).
+            xml_b = dump(timeout=5, attempts=1)
+            if _is_clips_nux_sheet(xml_b):
+                print("[pub] NUX poll — budget edge but About Reels up — reset 25s")
+                _section_begin("composer", 25)
+            else:
+                print("[pub] NUX poll — composer budget, stop i=%d" % i)
+                return False
         xml = dump(timeout=5, attempts=1)
         if _publish_succeeded(xml, fmt=fmt) or not _still_in_composer(xml, fmt=fmt):
             print("[pub] left composer during NUX wait i=%d" % i)
@@ -4685,6 +4718,40 @@ def _dismiss_story_to_story_nux(xml=None, label="story-nux"):
     return False
 
 
+def _is_stories_archive_nux(xml=None, tb=None):
+    """Post-share 'Stories archive' / saved-to-archive intro (Jazlene 2026-09-05)."""
+    tb = (tb if tb is not None else text_block(xml or dump())).lower()
+    if "stories archive" in tb:
+        return True
+    if "stories are saved to your archive" in tb:
+        return True
+    if "archived stories" in tb and "ok" in tb:
+        return True
+    return False
+
+
+def _dismiss_stories_archive_nux(xml=None, label="stories-archive"):
+    """Tap OK on Stories archive sheet. Never Manage settings."""
+    xml = xml or dump()
+    tb = text_block(xml)
+    if not _is_stories_archive_nux(xml, tb):
+        return False
+    print("[pub] Stories archive NUX — tap OK")
+    if tap_exact(xml, "OK", "Ok", "Got it", label="%s-ok" % label):
+        time.sleep(0.8)
+        return True
+    for n in nodes(xml):
+        if attr(n, "clickable") != "true":
+            continue
+        t = attr(n, "text").strip().lower()
+        d = attr(n, "content-desc").strip().lower()
+        if t in ("ok", "got it") or d in ("ok", "got it"):
+            if tapn(n, "%s-ok-node" % label):
+                time.sleep(0.8)
+                return True
+    return False
+
+
 def _is_giphy_overlay(xml=None, tb=None):
     """Caption GIF picker — Search GIPHY (ferventthrush 2026-08-17)."""
     tb = (tb if tb is not None else text_block(xml or dump())).lower()
@@ -4713,12 +4780,69 @@ def _story_text_tool_tb(tb):
     if any(p in tb for p in (
             "modern text style", "classic text style", "signature text style",
             "text color", "text emphasis", "stroke width tool",
-            "click to view text fonts")):
+            "click to view text fonts", "text animation", "text effect",
+            "text alignment")):
+        return True
+    # Compact style row without the long "… text style" desc (Jazlene dumps).
+    if ("modern" in tb and "classic" in tb and "signature" in tb
+            and "done" in tb):
         return True
     if "touch and hold to reposition" in tb or "use two fingers to rotate" in tb:
         return True
     return "done sticker" in tb and any(p in tb for p in (
         "text color", "text emphasis", "stroke width", "aa", "text tool"))
+
+
+def _exit_story_text_tool(xml=None, label="story-text-done"):
+    """Leave Aa/text overlay. Never mid-screen tap (that re-focuses the field).
+
+    Done vs not-Done (Jazlene confirmed 2026-09-05):
+    - Done present (Aa / Modern|Classic|Signature): tap Done (rid), else BACK.
+    - Not Done (share chrome already up, no Aa row): _is_story_text_tool is
+      False — do not thrash Done/IME; go straight to Your story.
+
+    Stories do not type captions. Old _hide_ime() mid-left tap kept focus on
+    text_overlay_edit_text so keyboard showed with an empty cursor.
+    """
+    xml = xml or dump()
+    if not _is_story_text_tool(xml):
+        return False
+    # Collapse keyboard without tapping the canvas / text field.
+    _adb_ime_off()
+    time.sleep(0.3)
+    xml = dump()
+    for attempt in range(3):
+        if not _is_story_text_tool(xml):
+            return True
+        tapped = False
+        for n in nodes(xml):
+            rid = attr(n, "resource-id").lower()
+            if "done_button" not in rid:
+                continue
+            if attr(n, "enabled").lower() not in ("", "true"):
+                continue
+            if tapn(n, "%s-rid-%d" % (label, attempt)):
+                tapped = True
+                break
+        if not tapped:
+            tapped = tap_exact(xml, "Done", label="%s-%d" % (label, attempt))
+        time.sleep(0.9)
+        xml = dump()
+        if not _is_story_text_tool(xml):
+            print("[story] left Aa text tool after Done")
+            return True
+        print("[story] Aa still up after Done — BACK (try %d)" % (attempt + 1))
+        adb("shell", "input", "keyevent", "KEYCODE_BACK")
+        time.sleep(0.85)
+        xml = dump()
+        if _is_draft_exit_sheet(text_block(xml)):
+            tap_exact(xml, "Keep editing", "Keep Editing", label="story-aa-keep")
+            time.sleep(0.7)
+            xml = dump()
+            break
+    ok = not _is_story_text_tool(xml)
+    print("[story] Aa exit %s" % ("ok" if ok else "FAILED"))
+    return ok
 
 
 def _is_story_asset_edit_tb(tb):
@@ -4741,7 +4865,24 @@ def _is_story_text_tool(xml=None, tb=None):
     # Nomix asset-edit tray (Audio/Text/Overlay/Ratio) also shows "Done" — not Aa.
     if _is_story_asset_edit_tb(tb):
         return False
-    return _story_text_tool_tb(tb)
+    # Share footer already up — do NOT treat as Aa. False positives here caused
+    # Done/IME thrash (keyboard flash, no typing) while Your story was visible
+    # (Jazlene 2026-09-05: n_cands=0 for 6 rounds then legacy Your story tap).
+    share_up = any(p in tb for p in (
+        "your story", "close friends", "add to your story", "share to story"))
+    aa_row = ("modern" in tb and "classic" in tb) or "modern text style" in tb \
+             or "signature text style" in tb
+    if share_up and not aa_row:
+        return False
+    if _story_text_tool_tb(tb):
+        return True
+    if xml is None:
+        return False
+    xl = xml.lower()
+    # Rid alone is not enough (share dumps can retain overlay ids). Require Aa row.
+    if aa_row and ("text_overlay_edit_text" in xl or "text_tool_format_picker" in xl):
+        return True
+    return False
 
 
 def _is_story_editor_chrome(xml=None, tb=None):
@@ -5263,11 +5404,13 @@ def _find_publish_nodes(xml, fmt="reel", allow_top_share=False):
             out.append((pri, -y, -x, w, n, "share_footer"))
             continue
 
-        # About Reels NUX Share — primary publish when sheet is up (rumeysa)
+        # About Reels NUX Share — MUST beat footer share_button when both are
+        # on screen (Dalia 2026-09-05: pri=0 + lower y let footer Next win while
+        # About Reels Share was the real confirm → POST_TIMEOUT).
         if "clips_nux_sheet_share" in rid:
             if not clk and y < int(sh * 0.55):
                 continue
-            out.append((0, -y, -x, w, n, "clips_nux_share"))
+            out.append((-1, -y, -x, w, n, "clips_nux_share"))
             continue
 
         # Classic share_button (Next) — never container
@@ -5326,9 +5469,32 @@ def _find_publish_nodes(xml, fmt="reel", allow_top_share=False):
             continue
 
         if fmt == "story":
+            # Footer share chips only. Top "Your story" (~y590) is NOT publish —
+            # Jazlene 2026-09-05: after footer miss/dead_xy, that tap left the
+            # editor without sharing (keyboard/caption still up).
+            story_y_min = int(sh * 0.72)
+            # Exact labels
             if t in ("your story", "add to your story", "share to story", "share") or \
                d in ("your story", "add to your story", "share to story", "share"):
-                out.append((1 if clk else 2, -y, -x, w, n, t or d))
+                if y < story_y_min:
+                    continue
+                out.append((0 if clk else 1, -y, -x, w, n, t or d or "your-story"))
+                continue
+            # Parent chips often have empty text; desc/rid carries the label
+            # (Jazlene 2026-09-05: tb had your story but n_cands=0).
+            blob = (t + " " + d + " " + rid)
+            if "your story" in blob or "add to your story" in blob or \
+               "share to story" in blob:
+                if "close friends" in blob:
+                    continue
+                if y < story_y_min:
+                    continue
+                out.append((0 if clk else 1, -y, -x, w, n, "your-story-blob"))
+                continue
+            if "post_capture_button_share" in rid and "container" not in rid:
+                if y < story_y_min:
+                    continue
+                out.append((1 if clk else 2, -y, -x, w, n, "story-share-rid"))
                 continue
             # Never use top Done (text/sticker tools) as story Share.
             if t in ("done",) or d in ("done",):
@@ -5341,6 +5507,9 @@ def _find_publish_nodes(xml, fmt="reel", allow_top_share=False):
                     continue
             # Edit-step Next (add more / ratio) is not final share — caller advances.
             if t == "next" or d == "next" or "next_button" in rid:
+                continue
+            # Never tap "add a caption" — opens keyboard with no story type path.
+            if "caption" in t or "caption" in d:
                 continue
 
         # Text/desc Share — clickable preferred; non-clickable OK in bottom band
@@ -5381,10 +5550,11 @@ def _find_reel_share_nodes(xml):
 def _tap_publish_cta(xml, fmt="reel", label="pub", allow_top_share=False, skip_xy=None):
     """Tap best publish CTA. skip_xy = set of rounded (x,y) already tried dead.
 
-    Sets _tap_publish_cta.last_xy on success. Returns bool.
+    Sets _tap_publish_cta.last_xy and .last_kind on success. Returns bool.
     """
     skip_xy = skip_xy or set()
     _tap_publish_cta.last_xy = None
+    _tap_publish_cta.last_kind = None
     cands = _find_publish_nodes(xml, fmt=fmt, allow_top_share=allow_top_share)
     for _pri, _nx, _ny, _w, n, kind in cands:
         x, y = bounds_center(n)
@@ -5395,6 +5565,7 @@ def _tap_publish_cta(xml, fmt="reel", label="pub", allow_top_share=False, skip_x
             continue
         if tapn_cta(n, "%s:%s" % (label, kind)):
             _tap_publish_cta.last_xy = key
+            _tap_publish_cta.last_kind = kind
             print("[pub] CTA pick %s @ %d,%d (skip=%d left=%d)"
                   % (kind, x, y, len(skip_xy), len(cands)))
             return True
@@ -5434,9 +5605,10 @@ def _tap_share_button_any(xml=None, label="share-any", skip_xy=None):
             kind = "share_footer"
             pri = 0 if clk else 1
         elif "clips_nux_sheet_share" in rid:
-            # About Reels confirm Share = publish (rumeysa)
+            # About Reels confirm Share = publish (rumeysa). Beat footer Next
+            # (Dalia 2026-09-05: same-pri sort preferred share_button @2762).
             kind = "clips_nux_share"
-            pri = 0
+            pri = -1
         elif "share_button" in rid or "share_sheet_button" in rid:
             if "container" in rid or "save_draft" in rid or "clips_nux" in rid:
                 continue
@@ -6036,6 +6208,7 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
     dead_cta_xy = set()  # rounded (x,y) that left us still on caption
     publish_from_composer._audio_tries = 0
     publish_from_composer._face_overlay_tried = False  # case B once only
+    publish_from_composer._story_footer_miss = 0
     edit_next_tries = 0
     for rnd in range(max_rounds):
         if _section_expired(need=2):
@@ -6046,18 +6219,45 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
         tb = text_block(xml)
         # Link/Aa sticker edit leaves Done + font chrome — exit before Share hunt.
         if fmt_key == "story" and _is_story_text_tool(xml, tb):
-            print("[pub] story text/sticker overlay — Done (round %d)" % (rnd + 1))
-            if not tap_exact(xml, "Done", label="pub-story-text-done"):
-                for n in nodes(xml):
-                    if attr(n, "clickable") != "true":
-                        continue
-                    d = attr(n, "content-desc").strip().lower()
-                    t = attr(n, "text").strip().lower()
-                    if d == "done" or t == "done":
-                        tapn(n, "pub-story-text-done-node")
-                        break
-            time.sleep(1.1)
+            print("[pub] story text/sticker overlay — exit (round %d)" % (rnd + 1))
+            _exit_story_text_tool(xml, label="pub-story-text-done")
+            time.sleep(0.4)
             continue
+        # Story share footer already visible — tap Your story BEFORE any IME/chrome
+        # path that can re-open Aa (Jazlene 2026-09-05 keyboard flash).
+        if fmt_key == "story" and any(p in tb.lower() for p in (
+                "your story", "add to your story", "share to story", "close friends")):
+            _adb_ime_off()
+            # Only footer CTAs via _tap_publish_cta (y>=72%H). Never tap_exact —
+            # it can hit a top "Your story" label and leave the editor unshared.
+            if _tap_publish_cta(xml, fmt="story", label="pub-story-early",
+                                skip_xy=dead_cta_xy):
+                time.sleep(2.8)
+                xml2 = dump()
+                if _dismiss_stories_archive_nux(xml2):
+                    time.sleep(0.6)
+                    xml2 = dump()
+                if _publish_succeeded(xml2, fmt=fmt_key) or \
+                   not _still_in_composer(xml2, fmt=fmt_key) or \
+                   _is_stories_archive_nux(xml2):
+                    print("[pub] SUCCESS story Your story early")
+                    return True
+                # Footer chip often still valid after dump timeout — only blacklist
+                # after 2 misses, and never blacklist while footer copy remains.
+                xy = getattr(_tap_publish_cta, "last_xy", None)
+                tb2 = text_block(xml2).lower()
+                footer_still = any(p in tb2 for p in (
+                    "your story", "add to your story", "share to story"))
+                miss = getattr(publish_from_composer, "_story_footer_miss", 0) + 1
+                publish_from_composer._story_footer_miss = miss
+                if xy and (miss >= 2 or not footer_still):
+                    dead_cta_xy.add(xy)
+                    print("[pub] story footer CTA dead @ %s miss=%d" % (xy, miss))
+                else:
+                    print("[pub] story footer miss=%d — retry same chip (still up)"
+                          % miss)
+                    continue
+            # fall through to normal hunt if early miss
         # Story multi-asset edit → Next until Your story / Share appears.
         if fmt_key == "story" and st == "EDIT_SCREEN":
             tbl = tb.lower()
@@ -6074,6 +6274,21 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
            not any(p in tb for p in ("write a caption", "add a caption", "tag people",
                                        "also share")):
             true_edit = True
+        # About Reels sheet already covering caption — tap its Share BEFORE
+        # OK+Share footer coords (Dalia 2026-09-05: footer Next under dimmer).
+        if fmt_key == "reel" and _is_clips_nux_sheet(xml):
+            if _dismiss_clips_nux(xml):
+                if getattr(_dismiss_clips_nux, "shared", False):
+                    time.sleep(1.5)
+                    xml2 = dump()
+                    if _publish_succeeded(xml2, fmt=fmt_key) or \
+                       not _still_in_composer(xml2, fmt=fmt_key):
+                        print("[pub] SUCCESS via About Reels NUX (pre-okshare)")
+                        _rt_log("publish", fmt=fmt, round=rnd,
+                                cta="about_reels_share_pre", state=st)
+                        return True
+                time.sleep(0.8)
+                continue
         if fmt_key in ("reel", "feed"):
             at_caption = (not true_edit) and (force_caption or _is_caption_composer(xml))
         else:
@@ -6153,6 +6368,15 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
 
         if _dismiss_giphy_overlay(xml):
             time.sleep(0.5)
+            continue
+        if _dismiss_stories_archive_nux(xml):
+            time.sleep(0.6)
+            xml2 = dump()
+            if fmt_key == "story" and (
+                    _publish_succeeded(xml2, fmt=fmt_key) or
+                    not _still_in_composer(xml2, fmt=fmt_key)):
+                print("[pub] SUCCESS after Stories archive OK")
+                return True
             continue
         if _dismiss_story_to_story_nux(xml):
             if fmt_key in ("feed", "carousel", "reel"):
@@ -6267,7 +6491,12 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
             print("[pub] audio still open after dismiss budget — try Share anyway")
             # fall through; Share may still be inert but better than infinite backs
 
-        _hide_ime()
+        # Story share chrome: NEVER mid-canvas tap — that focuses "add a caption…"
+        # / Aa and pops the keyboard with no typing (Jazlene 2026-09-05).
+        if fmt_key == "story":
+            _adb_ime_off()
+        else:
+            _hide_ime()
         xml = dump()
         st = detect_state(xml)
         tb = text_block(xml)
@@ -6388,6 +6617,14 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
             # #endregion
             time.sleep(3.5 if fmt_key != "story" else 4.0)
             xml2 = dump()
+            cta_kind = getattr(_tap_publish_cta, "last_kind", None) or ""
+            # About Reels Share IS publish — give upload/leave time + budget.
+            if fmt_key == "reel" and "clips_nux" in cta_kind:
+                if _SECTION is not None and _section_left() < 10:
+                    _section_begin("composer", 40)
+                print("[pub] About Reels NUX Share tapped — wait leave")
+                time.sleep(2.0)
+                xml2 = dump()
             if _publish_succeeded(xml2, fmt=fmt_key):
                 print("[pub] SUCCESS after CTA fmt=%s" % fmt)
                 return True
@@ -6408,6 +6645,21 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
                 if fmt_key == "reel" and (at_caption or force_caption):
                     if _poll_reel_nux_after_share(fmt=fmt_key):
                         return True
+                    # If we already hit NUX Share, don't spam Note8 footer under a
+                    # dead budget — one more NUX dismiss then stop.
+                    if "clips_nux" in cta_kind:
+                        xml_nux = dump()
+                        if _is_clips_nux_sheet(xml_nux):
+                            if _dismiss_clips_nux(xml_nux) and \
+                               getattr(_dismiss_clips_nux, "shared", False):
+                                time.sleep(2.0)
+                                xml_ok = dump()
+                                if _publish_succeeded(xml_ok, fmt=fmt_key) or \
+                                   not _still_in_composer(xml_ok, fmt=fmt_key):
+                                    print("[pub] SUCCESS via About Reels retry")
+                                    return True
+                        print("[pub] still caption after NUX Share — stop")
+                        return False
                     # Keyboard may still be covering Share — proven Note 8 sequence
                     print("[pub] still caption — Note8 OK then Share")
                     _note8_ok_then_share()
@@ -7663,6 +7915,17 @@ def _advance_to_caption(dest="feed", carousel=False, pick_count=1):
 
     for step in range(max_steps):
         if _section_expired(need=1.5):
+            if dest == "story" and photo_picked:
+                xml_b = dump()
+                if _dismiss_story_to_story_nux(xml_b, label="advance-budget-story-nux"):
+                    _section_begin("create", 40)
+                    print("[post] story-nux at budget edge — reset 40s")
+                    time.sleep(0.8)
+                    continue
+                if (_story_has_stickers_affordance(xml_b) or
+                        _is_story_asset_edit(xml_b)):
+                    print("[post] at story editor (share-ready at budget edge)")
+                    return True
             print("[post] create budget — leave advance")
             return False
         xml = dump()
@@ -7713,14 +7976,22 @@ def _advance_to_caption(dest="feed", carousel=False, pick_count=1):
             print("[FAIL] stuck on Android share sheet")
             return False
 
+        # Unblocks story-verify prove when intro sheet covers editor after Next.
+        if _dismiss_story_to_story_nux(xml, label="advance-story-nux"):
+            if _section_left() is not None and _section_left() < 25:
+                _section_begin("create", 55)
+                print("[post] story-nux — create budget reset 55s")
+            time.sleep(0.8)
+            continue
+
         if st in ("TIP_SHEET", "SYS_PERMISSION", "ONBOARD_CARD", "NOTIF_PROMPT") or \
            _is_reel_create_tip_tb(tb) or _is_preview_size_tip(xml, tb):
             # Story text tool / canvas mislabeled as tip (dorothhds129 2026-08-30).
             if dest == "story" and photo_picked:
                 if _is_story_text_tool(xml, tb):
-                    print("[post] story text tool — Done (exit Aa)")
-                    tap_exact(xml, "Done", label="story-text-done")
-                    time.sleep(1.0)
+                    print("[post] story text tool — exit Aa")
+                    _exit_story_text_tool(xml, label="story-text-done")
+                    time.sleep(0.5)
                     continue
                 if _story_has_stickers_affordance(xml):
                     print("[post] at story editor (tip misdetect)")
@@ -7796,7 +8067,9 @@ def _advance_to_caption(dest="feed", carousel=False, pick_count=1):
                 continue
 
         if dest == "story":
-            _hide_ime()
+            # Never _hide_ime() here — mid-tap opens Aa / caption with keyboard
+            # up and no typing (stories skip _apply_caption).
+            _adb_ime_off()
             tbls = tb.lower()
             if photo_picked and (_story_has_stickers_affordance(xml) or
                                  _is_story_asset_edit(xml, tb)):
@@ -7804,8 +8077,8 @@ def _advance_to_caption(dest="feed", carousel=False, pick_count=1):
                 return True
             if photo_picked and _is_story_text_tool(xml, tb):
                 story_done_stuck += 1
-                print("[post] story text tool — Done (exit Aa) try=%d" % story_done_stuck)
-                tap_exact(xml, "Done", label="story-text-done")
+                print("[post] story text tool — exit Aa try=%d" % story_done_stuck)
+                _exit_story_text_tool(xml, label="story-text-done")
                 human_pause(0.35, 0.75)
                 if story_done_stuck >= 3:
                     if _story_has_stickers_affordance(dump()) or \
@@ -8089,6 +8362,9 @@ def _advance_to_caption(dest="feed", carousel=False, pick_count=1):
                             print("[post] picker has no usable media")
                             return False
                     photo_picked = True
+                    if dest == "story":
+                        _section_begin("create", 55)
+                        print("[post] story pick ok — create budget reset 55s")
                 gallery_opened = True
                 time.sleep(1.0)
                 xml = dump()
@@ -8169,8 +8445,8 @@ def _advance_to_caption(dest="feed", carousel=False, pick_count=1):
                     print("[post] at story editor (EDIT_SCREEN)")
                     return True
                 if _is_story_text_tool(xml, tb):
-                    print("[post] story text tool — Done (exit Aa)")
-                    tap_exact(xml, "Done", label="story-text-done")
+                    print("[post] story text tool — exit Aa (EDIT_SCREEN)")
+                    _exit_story_text_tool(xml, label="story-text-done")
                     human_pause(0.35, 0.75)
                     continue
                 if _story_has_stickers_affordance(xml):
@@ -8277,6 +8553,9 @@ def _escape_to_profile():
             print("[post] escape-to-profile skip — state=%s" % st)
             return False
         if _dismiss_giphy_overlay(xml):
+            time.sleep(0.5)
+            continue
+        if _dismiss_stories_archive_nux(xml):
             time.sleep(0.5)
             continue
         if _dismiss_story_to_story_nux(xml):
@@ -9280,13 +9559,13 @@ def story_add_link_sticker(url, sticker_text=""):
             time.sleep(0.6)
         return not _in_sticker_tray()
 
-    _hide_ime()
+    _adb_ime_off()
     for _ in range(3):
         xml0 = dump()
         if not _is_story_text_tool(xml0):
             break
         print("[story] Aa/text tool open — Done before stickers")
-        tap_exact(xml0, "Done", label="story-text-done-pre-sticker")
+        _exit_story_text_tool(xml0, label="story-text-done-pre-sticker")
         time.sleep(1.0)
     xml = dump()
     opened = _open_story_sticker_tray(xml)
@@ -10331,18 +10610,20 @@ def _do_post_body(caption=CAPTION, image_path=None, username="", pkg=None,
                 LAST_POST_META["link_ok"] = "0"
                 print("[FAIL] story link sticker required but not confirmed")
                 return emit_fail("STORY_LINK_FAIL", note="link_sticker")
-        _hide_ime()
+        # Collapse IME only — never mid-canvas _hide_ime (opens empty Aa cursor).
+        _adb_ime_off()
         # Exit sticker/text overlay left by link Done before hunting Share.
-        for _ in range(3):
+        for _ in range(4):
             xml_pre = dump()
             if not _is_story_text_tool(xml_pre):
                 break
-            print("[story] text/sticker overlay before share — Done")
-            tap_exact(xml_pre, "Done", label="story-pre-share-done")
-            human_pause(0.45, 0.85)
+            print("[story] text/sticker overlay before share — exit")
+            if not _exit_story_text_tool(xml_pre, label="story-pre-share-done"):
+                break
+            human_pause(0.35, 0.7)
         human_think()
         _section_begin("composer")
-        shared = publish_from_composer(fmt="story", max_rounds=3)
+        shared = publish_from_composer(fmt="story", max_rounds=6)
         if not shared:
             # Fallback legacy CTAs once
             xml = dump()
@@ -10354,9 +10635,20 @@ def _do_post_body(caption=CAPTION, image_path=None, username="", pkg=None,
                       tap_exact(xml, "Share", "Your story", "Add to your story",
                                 label="story-share-legacy"))
             if shared:
-                time.sleep(3)
+                time.sleep(2.0)
+                # Post-share archive sheet — dismiss then continue to verify
+                for _ in range(3):
+                    if not _dismiss_stories_archive_nux():
+                        break
+                    time.sleep(0.6)
+                time.sleep(1.0)
         else:
-            time.sleep(3)
+            time.sleep(2.0)
+            for _ in range(3):
+                if not _dismiss_stories_archive_nux():
+                    break
+                time.sleep(0.6)
+            time.sleep(1.0)
         if not shared:
             hit = _check_action_limit(note="story_share_fail")
             if hit:
