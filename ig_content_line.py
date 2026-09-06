@@ -22,9 +22,11 @@ from farm_root import ROOT
 import json
 import os
 import re
+import time
 from datetime import datetime
 
 LINES_PATH = os.path.join(ROOT, 'ig_content_lines.json')
+LOCK_PATH = LINES_PATH + ".lock"
 USED_DIR = os.path.join(ROOT, 'used_ig_accounts')
 FORMATS = ("feed", "story", "carousel", "reel")
 
@@ -52,14 +54,81 @@ def _load():
         return {"lines": {}, "by_username": {}}
 
 
+def _lock(timeout=45.0):
+    """Exclusive lock so parallel farm phones don't race .tmp → json replace.
+
+    Nylah/Jazlene/Kianna 2026-09-05: WinError 32 on ig_content_lines.json.tmp
+    when 12 devices wrote the same ledger at once → account ERROR/SKIPPED.
+    """
+    deadline = time.time() + max(1.0, float(timeout))
+    while time.time() < deadline:
+        try:
+            fd = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_RDWR)
+            try:
+                os.write(fd, ("%d\n" % os.getpid()).encode("ascii", "replace"))
+            except OSError:
+                pass
+            return fd
+        except FileExistsError:
+            try:
+                age = time.time() - os.path.getmtime(LOCK_PATH)
+                if age > 120:
+                    os.remove(LOCK_PATH)
+                    continue
+            except OSError:
+                pass
+            time.sleep(0.05)
+    raise TimeoutError("ig_content_lines lock timeout")
+
+
+def _unlock(fd):
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+    try:
+        os.remove(LOCK_PATH)
+    except OSError:
+        pass
+
+
 def _save(data):
     parent = os.path.dirname(LINES_PATH)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    tmp = LINES_PATH + ".tmp"
+    # Per-PID tmp — never share one .tmp across parallel writers
+    tmp = "%s.tmp.%d.%d" % (LINES_PATH, os.getpid(), time.time_ns() % 1000000)
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(data, fh, indent=2, sort_keys=True)
-    os.replace(tmp, LINES_PATH)
+    last_err = None
+    for attempt in range(16):
+        try:
+            os.replace(tmp, LINES_PATH)
+            return
+        except PermissionError as e:
+            last_err = e
+            time.sleep(0.05 * (attempt + 1))
+        except OSError as e:
+            last_err = e
+            time.sleep(0.05 * (attempt + 1))
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    raise last_err or PermissionError("ig_content_lines save failed")
+
+
+def _mutate(fn):
+    """Run fn(data) under lock; return data to save, or None to skip save."""
+    fd = _lock()
+    try:
+        data = _load()
+        out = fn(data)
+        if out is not None:
+            _save(out)
+        return out
+    finally:
+        _unlock(fd)
 
 
 def line_id_for(username):
@@ -104,50 +173,55 @@ def ensure_line(username, drive_folder_id, line_id=None, warmup_profiles=None):
     fid = (drive_folder_id or "").strip()
     if not u or not fid:
         return None, "username and drive_folder_id required"
-    data = _load()
-    existing = data["by_username"].get(u)
-    if existing and existing in data["lines"]:
-        line = data["lines"][existing]
-        if fid and line.get("drive_folder_id") != fid:
-            line["drive_folder_id"] = fid
-        if warmup_profiles is not None:
-            line["warmup_profiles"] = list(warmup_profiles)
-        line["active_username"] = u
-        line["status"] = "active"
-        _save(data)
-        return existing, "updated"
-    # Reuse line that already owns this Drive folder (continuity attach)
-    for lid, line in data["lines"].items():
-        if line.get("drive_folder_id") == fid:
-            old = line.get("active_username") or ""
-            line["active_username"] = u
-            line["status"] = "active"
-            line.setdefault("history", []).append(
-                {"username": u, "at": _now(), "event": "attached", "prev": old}
-            )
+
+    result = {"lid": None, "msg": ""}
+
+    def _do(data):
+        existing = data["by_username"].get(u)
+        if existing and existing in data["lines"]:
+            line = data["lines"][existing]
+            if fid and line.get("drive_folder_id") != fid:
+                line["drive_folder_id"] = fid
             if warmup_profiles is not None:
                 line["warmup_profiles"] = list(warmup_profiles)
-            if old and old != u:
-                data["by_username"][old] = lid  # keep history pointer
-            data["by_username"][u] = lid
-            _save(data)
-            return lid, "attached_existing_folder"
-    lid = (line_id or "").strip() or ("line_%s" % _safe(u)[:24])
-    n = 1
-    base = lid
-    while lid in data["lines"]:
-        lid = "%s_%d" % (base, n)
-        n += 1
-    data["lines"][lid] = {
-        "drive_folder_id": fid,
-        "active_username": u,
-        "status": "active",
-        "warmup_profiles": list(warmup_profiles or []),
-        "history": [{"username": u, "at": _now(), "event": "created"}],
-    }
-    data["by_username"][u] = lid
-    _save(data)
-    return lid, "created"
+            line["active_username"] = u
+            line["status"] = "active"
+            result["lid"], result["msg"] = existing, "updated"
+            return data
+        for lid, line in data["lines"].items():
+            if line.get("drive_folder_id") == fid:
+                old = line.get("active_username") or ""
+                line["active_username"] = u
+                line["status"] = "active"
+                line.setdefault("history", []).append(
+                    {"username": u, "at": _now(), "event": "attached", "prev": old}
+                )
+                if warmup_profiles is not None:
+                    line["warmup_profiles"] = list(warmup_profiles)
+                if old and old != u:
+                    data["by_username"][old] = lid
+                data["by_username"][u] = lid
+                result["lid"], result["msg"] = lid, "attached_existing_folder"
+                return data
+        lid = (line_id or "").strip() or ("line_%s" % _safe(u)[:24])
+        n = 1
+        base = lid
+        while lid in data["lines"]:
+            lid = "%s_%d" % (base, n)
+            n += 1
+        data["lines"][lid] = {
+            "drive_folder_id": fid,
+            "active_username": u,
+            "status": "active",
+            "warmup_profiles": list(warmup_profiles or []),
+            "history": [{"username": u, "at": _now(), "event": "created"}],
+        }
+        data["by_username"][u] = lid
+        result["lid"], result["msg"] = lid, "created"
+        return data
+
+    _mutate(_do)
+    return result["lid"], result["msg"]
 
 
 def replace_account(dead_username, new_username, pool_note=""):
@@ -159,31 +233,38 @@ def replace_account(dead_username, new_username, pool_note=""):
     new = (new_username or "").strip()
     if not dead or not new:
         return False, "need dead and new username"
-    data = _load()
-    lid = data["by_username"].get(dead)
-    if not lid or lid not in data["lines"]:
-        return False, "no content line for %s" % dead
-    line = data["lines"][lid]
-    line["active_username"] = new
-    line["status"] = "active"
-    line.setdefault("history", []).append(
-        {
-            "username": new,
-            "at": _now(),
-            "event": "replace",
-            "prev": dead,
-            "note": pool_note or "",
-        }
-    )
-    data["by_username"][new] = lid
-    # Keep dead username mapped to same line for audit (optional tombstone)
-    data["by_username"][dead] = lid
-    _save(data)
-    print(
-        "[content-line] %s -> %s inherits line=%s folder=%s"
-        % (dead, new, lid, line.get("drive_folder_id"))
-    )
-    return True, lid
+    out = {"ok": False, "lid": None, "err": ""}
+
+    def _do(data):
+        lid = data["by_username"].get(dead)
+        if not lid or lid not in data["lines"]:
+            out["err"] = "no content line for %s" % dead
+            return None
+        line = data["lines"][lid]
+        line["active_username"] = new
+        line["status"] = "active"
+        line.setdefault("history", []).append(
+            {
+                "username": new,
+                "at": _now(),
+                "event": "replace",
+                "prev": dead,
+                "note": pool_note or "",
+            }
+        )
+        data["by_username"][new] = lid
+        data["by_username"][dead] = lid
+        out["ok"], out["lid"] = True, lid
+        print(
+            "[content-line] %s -> %s inherits line=%s folder=%s"
+            % (dead, new, lid, line.get("drive_folder_id"))
+        )
+        return data
+
+    _mutate(_do)
+    if out["ok"]:
+        return True, out["lid"]
+    return False, out["err"] or "replace failed"
 
 
 def mark_line_status(username, status):
@@ -191,16 +272,18 @@ def mark_line_status(username, status):
     lid = line_id_for(username)
     if not lid:
         return False
-    data = _load()
-    line = data["lines"].get(lid)
-    if not line:
-        return False
-    line["status"] = (status or "dead").strip().lower()
-    line.setdefault("history", []).append(
-        {"username": username, "at": _now(), "event": "status:%s" % line["status"]}
-    )
-    _save(data)
-    return True
+
+    def _do(data):
+        line = data["lines"].get(lid)
+        if not line:
+            return None
+        line["status"] = (status or "dead").strip().lower()
+        line.setdefault("history", []).append(
+            {"username": username, "at": _now(), "event": "status:%s" % line["status"]}
+        )
+        return data
+
+    return _mutate(_do) is not None
 
 
 def warmup_profiles_for(username):
@@ -215,11 +298,17 @@ def set_warmup_profiles(username, profiles):
     lid = line_id_for(username)
     if not lid:
         return False, "no content line - ensure_line first"
-    data = _load()
-    data["lines"][lid]["warmup_profiles"] = [
-        p.strip().lstrip("@") for p in (profiles or []) if p and str(p).strip()
-    ]
-    _save(data)
+
+    def _do(data):
+        if lid not in data["lines"]:
+            return None
+        data["lines"][lid]["warmup_profiles"] = [
+            p.strip().lstrip("@") for p in (profiles or []) if p and str(p).strip()
+        ]
+        return data
+
+    if _mutate(_do) is None:
+        return False, "no content line - ensure_line first"
     return True, "ok"
 
 

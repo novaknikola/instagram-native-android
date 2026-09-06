@@ -432,6 +432,31 @@ def _labeled_share_or_next(t, d):
     return t in ("share", "next", "post") or d in ("share", "next", "post")
 
 
+def _is_direct_or_row_share_rid(rid):
+    """DM / row share icons — not New reel footer Share/Next.
+
+    Yasmin 2026-09-05: direct_share_button @ y~2082 matched 'share_button' substring
+    → false CTA + publish True while still on caption → POST_TIMEOUT.
+    """
+    rid = (rid or "").lower()
+    return ("direct_share" in rid or "row_share" in rid or "reshare" in rid
+            or "share_to_" in rid or "share_sheet_row" in rid)
+
+
+def _is_caption_footer_share_rid(rid):
+    """True for real New reel/post footer Share/Next resource-ids only."""
+    rid = (rid or "").lower()
+    if not rid or _is_direct_or_row_share_rid(rid):
+        return False
+    if "save_draft" in rid or "clips_nux" in rid:
+        return False
+    if "share_footer_button" in rid and "container" not in rid:
+        return True
+    if rid.endswith(":id/share_button") or rid.endswith("/share_button"):
+        return True
+    return False
+
+
 def _tap_share_container_next(n, label="share-container-next"):
     """Tap RIGHT half of share_button_container (Next), never left Save draft.
 
@@ -461,6 +486,8 @@ def _find_reel_caption_share_target(xml):
     btn = cont = footer = None
     for n in nodes(xml):
         rid = attr(n, "resource-id").lower()
+        if _is_direct_or_row_share_rid(rid):
+            continue
         if "share_footer_button" in rid and "container" not in rid:
             footer = n
         elif "share_button_container" in rid:
@@ -476,11 +503,13 @@ def _find_reel_caption_share_target(xml):
         en = attr(btn, "enabled").lower() in ("", "true")
         if en:
             return btn, "share_button"
-        if _labeled_share_or_next(t, d):
-            # input tap ignores View.enabled — prefer the real button bounds.
-            # Container-only taps still miss on some builds (Dalia 2026-09-05).
-            print("[pub] share_button Next/Share enabled=false — force tap button")
-            return btn, "share_button_disabled"
+        # Disabled footer Next/Share — always force (label optional; some builds
+        # leave text empty). Prefer button bounds; container is fallback below.
+        print("[pub] share_button Next/Share enabled=false — force tap button")
+        return btn, "share_button_disabled"
+    if cont is not None and (
+            btn is None or attr(btn, "enabled").lower() not in ("", "true")):
+        return cont, "share_container_disabled_btn"
     if footer is not None:
         return footer, "share_footer"
     return None, None
@@ -531,30 +560,122 @@ def _wait_reel_share_ready(xml=None, waits=10, pause=0.8):
     return xml
 
 
+def _nudge_reel_composer_for_share(xml=None):
+    """Nudge caption composer so disabled Share/Next can re-bind."""
+    xml = xml or dump()
+    sw, sh = _screen_wh(xml)
+    _adb_ime_off()
+    time.sleep(0.25)
+    # Unfocus caption / cover chrome then light scroll toward footer.
+    tap(int(sw * 0.07), int(sh * 0.40))
+    time.sleep(0.35)
+    adb("shell", "input", "swipe", str(sw // 2), str(int(sh * 0.72)),
+        str(sw // 2), str(int(sh * 0.55)), "280")
+    time.sleep(0.7)
+    return dump()
+
+
 def _unstick_disabled_reel_share(xml=None):
     """When Share/Next stays enabled=false, nudge composer then force-tap.
 
     Dalia/Meghan 2026-09-05: button stayed disabled after container taps; waiting
     + force input-tap on the button bounds + light scroll often enables it.
+    Krista 2026-09-05: single force-tap then abort left Share disabled forever —
+    wait longer, nudge, then button + container taps.
     """
     xml = xml or dump()
-    xml = _wait_reel_share_ready(xml, waits=8, pause=0.75)
+    xml = _wait_reel_share_ready(xml, waits=12, pause=0.9)
     n, kind = _find_reel_caption_share_target(xml)
     if n is not None and kind in ("share_button", "share_footer"):
         return _tap_reel_caption_share(xml, label="unstick-enabled")
-    # Light scroll so footer binds / cover finishes
-    sw, sh = _screen_wh(xml)
-    adb("shell", "input", "swipe", str(sw // 2), str(int(sh * 0.72)),
-        str(sw // 2), str(int(sh * 0.55)), "280")
-    time.sleep(0.8)
-    xml = _wait_reel_share_ready(dump(), waits=6, pause=0.6)
+    xml = _nudge_reel_composer_for_share(xml)
+    xml = _wait_reel_share_ready(xml, waits=10, pause=0.8)
     if _tap_reel_caption_share(xml, label="unstick-force"):
         return True
-    # Last resort: container right half
-    for n2 in nodes(xml):
-        if "share_button_container" in attr(n2, "resource-id").lower():
-            return _tap_share_container_next(n2, label="unstick-container")
+    # Container right half (Save draft is left)
+    for n2 in nodes(xml or dump()):
+        rid = attr(n2, "resource-id").lower()
+        if "share_button_container" in rid and not _is_direct_or_row_share_rid(rid):
+            if _tap_share_container_next(n2, label="unstick-container"):
+                return True
+    # Hard footer coord as last nudge (Note8 Share)
+    sw, sh = _wm_size()
+    if sw >= 1400 and sh >= 2800:
+        tap(1068, 2762)
+        print("[pub] unstick Note8 Share @ 1068,2762")
+        return True
     return False
+
+
+def _reel_share_stuck_system_back():
+    """Post-Share limbo on New reel → system Back → previous → retry Share.
+
+    Operator prove 2026-09-05: after Share was already tapped and About Reels
+    (if any) is gone, IG can sit on a *dimmed* caption with Share untappable —
+    the last step before upload/leave. Nav Back → Edit (or prior), then
+    re-Next + Share publishes. Reels only. Not the About Reels sheet itself.
+    """
+    print("[pub] post-Share stuck (dimmed / Share dead) — system BACK then retry")
+    _adb_ime_off()
+    time.sleep(0.3)
+    xml = dump()
+    # Rare leftover sheets only — main case is already past About Reels.
+    if _is_tag_people_sheet(xml):
+        _dismiss_tag_people(xml)
+        time.sleep(0.8)
+        xml = dump()
+    if _is_audio_picker_overlay(xml):
+        _dismiss_audio_picker()
+        time.sleep(0.8)
+        xml = dump()
+    # Dimmer still covering the dead Share — dismiss chrome, then Back.
+    for n in nodes(xml):
+        rid = attr(n, "resource-id").lower()
+        if "background_dimmer" in rid and attr(n, "clickable") == "true":
+            x, y = bounds_center(n)
+            if x is not None and y is not None:
+                print("[pub] tap leftover background_dimmer @ %d,%d" % (x, y))
+                tap(x, max(80, (y // 3) if y > 200 else 120))
+                time.sleep(0.9)
+                xml = dump()
+            break
+    # If Share re-enabled after dimmer tap, try one force Share before leaving.
+    n_share, kind_share = _find_reel_caption_share_target(xml)
+    if kind_share in ("share_button", "share_footer"):
+        print("[pub] Share live again after dimmer — tap once before BACK")
+        if _tap_reel_caption_share(xml, label="stuck-dimmer-share"):
+            time.sleep(2.5)
+            xml2 = dump()
+            if _publish_succeeded(xml2, fmt="reel") or \
+               not _still_in_composer(xml2, fmt="reel"):
+                print("[pub] SUCCESS via Share after dimmer clear")
+                return xml2
+    adb("shell", "input", "keyevent", "KEYCODE_BACK")
+    time.sleep(1.4)
+    xml = dump()
+    tb = text_block(xml)
+    if _is_draft_exit_sheet(tb):
+        print("[pub] draft sheet after stuck-BACK — Keep editing")
+        tap_exact(xml, "Keep editing", "Keep Editing", label="stuck-back-keep")
+        time.sleep(1.0)
+        xml = dump()
+    if _still_on_share_caption(xml) or _is_caption_composer(xml):
+        print("[pub] still caption after BACK — BACK again")
+        adb("shell", "input", "keyevent", "KEYCODE_BACK")
+        time.sleep(1.3)
+        xml = dump()
+        tb = text_block(xml)
+        if _is_draft_exit_sheet(tb):
+            tap_exact(xml, "Keep editing", "Keep Editing", label="stuck-back-keep2")
+            time.sleep(1.0)
+            xml = dump()
+    st = detect_state(xml)
+    print("[pub] after stuck-BACK state=%s caption=%s true_edit=%s"
+          % (st, _is_caption_composer(xml), _is_true_reel_edit(xml)))
+    if _SECTION is not None and _section_left() < 15:
+        _section_begin("composer", 50)
+        print("[pub] stuck-BACK — composer budget refreshed 50s")
+    return xml
 
 
 def _vision_tap(name, question="", tag=""):
@@ -5149,8 +5270,10 @@ def _tap_share_chip(xml=None):
         return True
     xml = xml or dump()
     sw, sh = _screen_wh(xml)
-    floor = int(sh * 0.58)
-    ceil = int(sh * 0.98)  # Note8 Share @~2762; share chip ceil 0.98
+    # Footer Share lives ~90%+ (Note8 @~2762). Mid-screen direct_share ~2082
+    # must never win (Yasmin 2026-09-05).
+    floor = int(sh * 0.82)
+    ceil = int(sh * 0.98)
     right_nav = int(sw * 0.95)  # Share sits right
     best = None
     # Prefer real share_button / share_footer_button (Nylah dump 2026-09-04)
@@ -5158,9 +5281,14 @@ def _tap_share_chip(xml=None):
         rid = attr(n, "resource-id").lower()
         if "container" in rid or "save_draft" in rid or "clips_nux" in rid:
             continue
-        if "share_button" not in rid and "share_footer_button" not in rid:
+        if _is_direct_or_row_share_rid(rid):
             continue
-        if attr(n, "enabled").lower() not in ("", "true"):
+        if not _is_caption_footer_share_rid(rid):
+            continue
+        # Force-tap disabled footer Share; skip other disabled rids.
+        en = attr(n, "enabled").lower() in ("", "true")
+        if not en and not (rid.endswith(":id/share_button") or rid.endswith("/share_button")
+                           or "share_footer_button" in rid):
             continue
         x, y = bounds_center(n)
         if x is None or y is None or y < floor or y > ceil:
@@ -5176,6 +5304,8 @@ def _tap_share_chip(xml=None):
         d = attr(n, "content-desc").strip().lower()
         rid = attr(n, "resource-id").lower()
         if "clips_right_action" in rid or "cam_dest_" in rid or "save_draft" in rid:
+            continue
+        if _is_direct_or_row_share_rid(rid):
             continue
         labeled = t in ("share", "next", "post") or d in ("share", "next", "post")
         footer = "share_footer_button" in rid
@@ -5415,9 +5545,12 @@ def _is_caption_composer(xml=None):
         t = attr(n, "text").strip().lower()
         x, y = bounds_center(n)
         if "share_button" in rid or "share_footer_button" in rid:
+            if _is_direct_or_row_share_rid(rid) or "container" in rid:
+                continue
             has_share_btn = True
         if y and y >= 1600 and (t == "next" or d == "next" or "clips_right_action" in rid
-                                or "share_button" in rid or "share_footer" in rid):
+                                or (("share_button" in rid or "share_footer" in rid)
+                                    and not _is_direct_or_row_share_rid(rid))):
             has_bottom_next = True
     if has_share_btn and "recents" not in tb:
         return True
@@ -5559,13 +5692,15 @@ def _find_publish_nodes(xml, fmt="reel", allow_top_share=False):
             out.append((-1, -y, -x, w, n, "clips_nux_share"))
             continue
 
-        # Classic share_button (Next) — never container
+        # Classic share_button (Next) — never container / direct_share
         if "share_button" in rid or "share_sheet_button" in rid or \
            "post_capture_button_share" in rid:
             if "container" in rid:
                 continue
             if "clips_nux" in rid:
                 continue  # handled above / Cancel path
+            if _is_direct_or_row_share_rid(rid):
+                continue
             if not clk and y < bottom_y:
                 continue
             if y < 1600 and fmt in ("reel", "feed") and not allow_top_share:
@@ -5573,6 +5708,10 @@ def _find_publish_nodes(xml, fmt="reel", allow_top_share=False):
             labeled = t in ("share", "next", "post") or d in ("share", "next", "post")
             if y > int(sh * 0.93) and not labeled:
                 continue  # unlabeled IME / sysbar — labeled Next lives ~2762
+            # Mid-screen share icons are not footer publish (Yasmin direct_share).
+            if y < int(sh * 0.78) and not (
+                    rid.endswith("/share_button") or rid.endswith(":id/share_button")):
+                continue
             pri = 0
             if rid.endswith("/share_button") or rid.endswith(":id/share_button"):
                 pri = 0
@@ -5768,7 +5907,13 @@ def _tap_share_button_any(xml=None, label="share-any", skip_xy=None):
         elif "share_button" in rid or "share_sheet_button" in rid:
             if "container" in rid or "save_draft" in rid or "clips_nux" in rid:
                 continue
+            if _is_direct_or_row_share_rid(rid):
+                continue
             if not clk and y < bottom_y:
+                continue
+            # Mid-screen DM share icon is not publish (Yasmin @~2082).
+            if y < int(sh * 0.78) and not (
+                    rid.endswith("/share_button") or rid.endswith(":id/share_button")):
                 continue
             kind = "share_button"
             pri = 0 if y >= bottom_y else 2
@@ -6364,6 +6509,8 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
     dead_cta_xy = set()  # rounded (x,y) that left us still on caption
     publish_from_composer._audio_tries = 0
     publish_from_composer._face_overlay_tried = False  # case B once only
+    publish_from_composer._unstick_tries = 0
+    publish_from_composer._share_back_tries = 0
     publish_from_composer._story_footer_miss = 0
     edit_next_tries = 0
     for rnd in range(max_rounds):
@@ -6470,9 +6617,16 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
             xml2 = dump()
             # Strict: stale dump after timeout looked like FEED and false-succeeded
             # (Jazlene 2026-09-04: SUCCESS after OK+Share then still on caption).
+            # Yasmin 2026-09-05: direct_share tap + flaky dump → True then POST_TIMEOUT.
             if _publish_succeeded(xml2, fmt=fmt_key):
-                print("[pub] SUCCESS after OK+Share")
-                return True
+                time.sleep(0.7)
+                xml2b = dump()
+                if _still_in_composer(xml2b, fmt=fmt_key) or _still_on_share_caption(xml2b):
+                    print("[pub] OK+Share false success — still caption, continue")
+                    xml2 = xml2b
+                else:
+                    print("[pub] SUCCESS after OK+Share")
+                    return True
             if _is_clips_nux_sheet(xml2):
                 if _dismiss_clips_nux(xml2) and getattr(_dismiss_clips_nux, "shared", False):
                     time.sleep(1.2)
@@ -6482,11 +6636,16 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
                         return True
             if _still_in_composer(xml2, fmt=fmt_key) or _still_on_share_caption(xml2):
                 print("[pub] OK+Share coords missed - Share chip/rid")
-                _tap_share_chip(xml2) or _tap_share_button_any(xml2, label="okshare-rid") or (
-                    _section_left() >= 12 and _vision_share_button())
+                n_miss, kind_miss = _find_reel_caption_share_target(xml2)
+                if kind_miss in ("share_button_disabled", "share_container_disabled_btn"):
+                    print("[pub] Share still disabled after OK+Share — unstick")
+                    _unstick_disabled_reel_share(xml2)
+                else:
+                    _tap_share_chip(xml2) or _tap_share_button_any(xml2, label="okshare-rid") or (
+                        _section_left() >= 12 and _vision_share_button())
                 time.sleep(1.0)
                 xml2 = dump()
-                if _publish_succeeded(xml2, fmt=fmt_key):
+                if _publish_succeeded(xml2, fmt=fmt_key) and not _still_in_composer(xml2, fmt=fmt_key):
                     print("[pub] SUCCESS after Share chip/rid")
                     return True
             elif detect_state(xml2) == "FEED" and not _still_in_composer(xml2, fmt=fmt_key):
@@ -6856,7 +7015,39 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
                         return True
                     if _poll_reel_nux_after_share(fmt=fmt_key):
                         return True
-                    print("[pub] still caption after Share — stop (no NUX, no 10min retry)")
+                    # Krista 2026-09-05: disabled Share + early return False burned
+                    # remaining rounds. Unstick + continue instead of abort.
+                    n_dis, kind_dis = _find_reel_caption_share_target(dump())
+                    unstick_n = getattr(publish_from_composer, "_unstick_tries", 0)
+                    if kind_dis in ("share_button_disabled", "share_container_disabled_btn") \
+                       and unstick_n < 3:
+                        publish_from_composer._unstick_tries = unstick_n + 1
+                        print("[pub] Share still disabled — unstick try %d"
+                              % publish_from_composer._unstick_tries)
+                        if _SECTION is not None and _section_left() < 12:
+                            _section_begin("composer", 40)
+                        _unstick_disabled_reel_share()
+                        time.sleep(2.0)
+                        xml_u = dump()
+                        if _publish_succeeded(xml_u, fmt=fmt_key) or \
+                           not _still_in_composer(xml_u, fmt=fmt_key):
+                            print("[pub] SUCCESS via unstick after CTA")
+                            return True
+                        if _poll_reel_nux_after_share(fmt=fmt_key):
+                            return True
+                        continue
+                    # Operator prove 2026-09-05: AFTER Share (About Reels already
+                    # gone) screen can stay dimmed with Share dead — last step
+                    # before upload. System BACK → Edit → re-Next/Share.
+                    back_n = getattr(publish_from_composer, "_share_back_tries", 0)
+                    if back_n < 2:
+                        publish_from_composer._share_back_tries = back_n + 1
+                        print("[pub] post-Share limbo (dimmed) — system BACK retry %d/2"
+                              % publish_from_composer._share_back_tries)
+                        _reel_share_stuck_system_back()
+                        dead_cta_xy.clear()
+                        continue
+                    print("[pub] still caption after Share — stop (BACK retries exhausted)")
                     return False
                 # Case B (feed only): transparent face over caption.
                 if (not getattr(publish_from_composer, "_face_overlay_tried", False)
@@ -10959,6 +11150,19 @@ def _do_post_body(caption=CAPTION, image_path=None, username="", pkg=None,
     # Meghan 2026-09-05: max_rounds=2 died before container Next retry + NUX.
     shared = publish_from_composer(
         fmt=pub_fmt, max_rounds=8 if fmt == "reel" else 3, force_caption=True)
+    if not shared and fmt == "reel":
+        # Last-chance: system BACK off stuck caption, then one more publish pass.
+        print("[post] post-Share limbo — system BACK recovery then one more publish")
+        _reel_share_stuck_system_back()
+        xml_rec = dump()
+        if _is_true_reel_edit(xml_rec) or detect_state(xml_rec) == "EDIT_SCREEN":
+            _tap_edit_advance_next(xml_rec, label="post-back-recov-edit-next") or \
+                _tap_publish_cta(xml_rec, fmt="reel", label="post-back-recov-next")
+            time.sleep(1.5)
+        if _SECTION is not None and _section_left() < 12:
+            _section_begin("composer", 45)
+        shared = publish_from_composer(
+            fmt=pub_fmt, max_rounds=4, force_caption=True)
     if not shared:
         hit = _check_action_limit(note="share_blocked")
         if hit:
@@ -10972,8 +11176,19 @@ def _do_post_body(caption=CAPTION, image_path=None, username="", pkg=None,
         return hit
     _rt_log("shared", fmt=fmt, cta="publish_from_composer")
     if _still_in_composer(dump(), fmt="reel" if fmt == "reel" else "feed"):
-        print("[FAIL] publish returned True but still on caption")
-        return emit_fail("POST_TIMEOUT")
+        if fmt == "reel":
+            print("[post] still on caption after Share (dimmed limbo) — system BACK")
+            _reel_share_stuck_system_back()
+            xml_rec = dump()
+            if _is_true_reel_edit(xml_rec) or detect_state(xml_rec) == "EDIT_SCREEN":
+                _tap_edit_advance_next(xml_rec, label="post-false-share-edit") or \
+                    _tap_publish_cta(xml_rec, fmt="reel", label="post-false-share-next")
+                time.sleep(1.2)
+            publish_from_composer(fmt=pub_fmt, max_rounds=3, force_caption=True)
+            time.sleep(1.0)
+        if _still_in_composer(dump(), fmt="reel" if fmt == "reel" else "feed"):
+            print("[FAIL] publish returned True but still on caption")
+            return emit_fail("POST_TIMEOUT")
     # Do not sit on New reel staring. Poll upload at most ~8s then verify.
     t_up = time.time()
     while time.time() - t_up < 8:

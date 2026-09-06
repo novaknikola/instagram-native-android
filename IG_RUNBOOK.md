@@ -19,6 +19,11 @@ PC proxy_pool.py  →  127.0.0.1:10801–10820  →  Floppydata sticky session
 - Listener map: `proxy_state/device_ports.json` (or threads copy if native file empty).
 - Creds: `floppydata_proxy.json` (gitignored). Provider default in `proxy_pool.py` is **floppydata**.
 - Any exit country is accepted. `PROXY_DEAD` = no SOCKS exit IP. That is **not** Instagram captcha.
+- **Unique exit IPs (2026-09-05):** farm phones must not share one residential exit
+  (shared `171.231…` → IG soft-block / disabled Share → `POST_TIMEOUT`). Default
+  `IG_UNIQUE_EXIT=1` rotates sticky sessions until each serial claims a distinct
+  exit (`ig_exit_claims.json`). Preflight: `python -u ensure_unique_exits.py --manifest …`
+  or automatic at `run_ig_farm.py` start. Opt out: `IG_UNIQUE_EXIT=0` or `--skip-unique-exit`.
 - `ALL_IPS_MASKED` was a Threads leftover (IP-lookup false dead / captcha renamed). IG now keeps `CAPTCHA` / `CONTACT_VERIFY`. Old CSV rows with `ALL_IPS_MASKED` are retryable (removed from dead-ledger).
 
 NekoBox package: `moe.nb4a`. Connect:  

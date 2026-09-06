@@ -18,6 +18,10 @@ import sys, os, csv, json, time, datetime, shutil, random
 import ig_loop as t
 import drive_content_ig as dc
 import ig_sticky_ip as sticky
+try:
+    import ig_exit_fleet as exit_fleet
+except Exception:
+    exit_fleet = None
 
 try:
     import ig_media_names as mn
@@ -192,6 +196,8 @@ def login_with_sticky(clone, u, p, s, base_session, primary, fallback):
 
     Prove farm SOCKS exit BEFORE opening Instagram (CDN + edge-chat).
     Any exit country is accepted; never return LOGGED_IN without a live exit IP.
+    When IG_UNIQUE_EXIT=1 (default), rotate until this phone's exit is not shared
+    with another farm phone (shared exit → IG spam / disabled Share).
     """
     token, sticky_cc, reused = sticky.make_session_token(base_session, SERIAL, clone)
     country = sticky_cc or primary or "us"
@@ -205,6 +211,52 @@ def login_with_sticky(clone, u, p, s, base_session, primary, fallback):
         time.sleep(2.0)
         return t.set_proxy_session(sess, country=cc)
 
+    def _ensure_unique(sess, cc, exit_ip):
+        """Rotate while exit_ip is already claimed/sticky on another serial."""
+        if exit_fleet is None or not exit_fleet.unique_enabled() or not exit_ip:
+            return sess, cc, exit_ip
+        tries = exit_fleet.max_rotate_tries()
+        for i in range(tries):
+            ok, holder = exit_fleet.try_claim(
+                SERIAL, clone, exit_ip, session=sess, username=u)
+            if ok:
+                if i:
+                    print("[%s] %s | unique exit OK after %d rotate(s): %s"
+                          % (SERIAL, u, i, exit_ip))
+                return sess, cc, exit_ip
+            who = "?"
+            if holder:
+                who = "%s/%s" % (
+                    (holder.get("serial") or "")[-8:],
+                    (holder.get("username") or holder.get("clone") or "?"),
+                )
+            print("[%s] %s | exit %s shared with %s — rotate %d/%d"
+                  % (SERIAL, u, exit_ip, who, i + 1, tries))
+            if not ALLOW_IP_ROTATE:
+                print("[%s] %s | UNIQUE_EXIT blocked by --no-ip-rotate"
+                      % (SERIAL, u))
+                return sess, cc, exit_ip
+            rot, rot_cc = sticky.controlled_rotate_token(
+                SERIAL, clone, country=fallback or primary or cc)
+            exit2 = _verify_exit(rot, rot_cc)
+            if not exit2:
+                print("[%s] %s | rotate verify failed — retry" % (SERIAL, u))
+                time.sleep(1.5)
+                continue
+            if exit2 == exit_ip:
+                print("[%s] %s | provider returned SAME exit after rotate — retry"
+                      % (SERIAL, u))
+            sess, cc, exit_ip = rot, rot_cc, exit2
+            time.sleep(0.8)
+        print("=" * 60)
+        print("[FIX NEEDED] UNIQUE_EXIT failed on %s (%s) — still shared %s "
+              "after %d rotates (Floppy pool may be collapsing sessions)"
+              % (SERIAL, u, exit_ip, tries))
+        print("=" * 60)
+        # Last claim attempt anyway so ledger reflects current exit.
+        exit_fleet.try_claim(SERIAL, clone, exit_ip, session=sess, username=u)
+        return sess, cc, exit_ip
+
     print("[%s] %s | sticky clone=%s session=%s country=%s reused=%s rotate=%s"
           % (SERIAL, u, clone.split(".")[-1], token, country, reused, ALLOW_IP_ROTATE))
 
@@ -215,6 +267,8 @@ def login_with_sticky(clone, u, p, s, base_session, primary, fallback):
               % (SERIAL, u))
         print("=" * 60)
         return "PROXY_DEAD", country, token, None
+
+    token, country, exit_ip = _ensure_unique(token, country, exit_ip)
 
     if _already_logged_in(clone, u):
         sticky.bind(SERIAL, clone, token, country, exit_ip, username=u)
@@ -244,6 +298,7 @@ def login_with_sticky(clone, u, p, s, base_session, primary, fallback):
                   % (SERIAL, u))
             print("=" * 60)
             return "PROXY_DEAD", country, token, None
+        token, country, exit_ip = _ensure_unique(token, country, exit_ip)
 
     if login == "LOGGED_IN":
         sticky.bind(SERIAL, clone, token, country, exit_ip or "", username=u)
@@ -260,6 +315,8 @@ def login_with_sticky(clone, u, p, s, base_session, primary, fallback):
         )
         print("[%s] %s | controlled rotate after %s -> %s" % (SERIAL, u, login, rot))
         login2, exit2 = _one_try(rot, cc, clear_app=True)
+        if exit2:
+            rot, cc, exit2 = _ensure_unique(rot, cc, exit2)
         if login2 == "LOGGED_IN":
             sticky.bind(SERIAL, clone, rot, cc, exit2 or "", username=u)
             return login2, cc, rot, exit2
@@ -288,8 +345,13 @@ def _ensure_content_line(u, item):
                 fid = (dca.load_map() or {}).get(u) or ""
         except Exception:
             fid = ""
-    if fid:
+    if not fid:
+        return
+    try:
         cl.ensure_line(u, fid, warmup_profiles=item.get("warmup_profiles"))
+    except Exception as e:
+        # Parallel farm: ledger race must not skip the whole account/post.
+        print("[%s] content-line warn (continue post): %s" % (SERIAL, e))
 
 
 def _normalize_local_media(paths, workdir):

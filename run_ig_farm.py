@@ -421,6 +421,41 @@ try:
               % (len(plans) - n_vpn))
 except Exception as e:
     print("[vpn] enable skip: %s" % e)
+
+# Unique exit IP per phone before parallel post (shared exit → spam / POST_TIMEOUT).
+_unique_env = (os.environ.get("IG_UNIQUE_EXIT") or "1").strip().lower()
+if _unique_env not in ("0", "false", "no", "off") and "--skip-unique-exit" not in a:
+    try:
+        import ensure_unique_exits as _uex
+        import ig_sticky_ip as _sticky
+        _jobs = []
+        for _serial, _items in plans.items():
+            _it = (_items or [{}])[0]
+            _clone = (_it.get("clone") or "").strip()
+            _user = (_it.get("username") or "").strip()
+            if not _clone:
+                _row = _sticky.get(_serial)
+                # sticky.get needs clone — scan ledger
+                for _k, _r in _sticky._load().items():
+                    if _k.startswith(_serial + "|"):
+                        _clone = _k.split("|", 1)[1]
+                        _user = _user or (_r.get("username") or "")
+                        break
+            if _clone:
+                _jobs.append({
+                    "serial": _serial, "clone": _clone, "username": _user,
+                })
+        if _jobs:
+            print("[farm] ensuring unique exit IPs for %d phone(s)…" % len(_jobs))
+            _res = _uex.ensure_jobs(_jobs, country=COUNTRY, clear_first=True)
+            _fail = [r for r in _res if not r.get("ok")]
+            if _fail:
+                print("[farm] UNIQUE_EXIT incomplete for %d phone(s) — "
+                      "continuing (device runner will retry rotate)"
+                      % len(_fail))
+    except Exception as e:
+        print("[farm] unique-exit preflight skip: %s" % e)
+
 print("run mode: %s" % ("PARALLEL" if PARALLEL else "SERIAL (--serial)"))
 
 try:

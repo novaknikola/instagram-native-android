@@ -106,17 +106,20 @@ def make_session_token(base_session, serial, clone):
 
 def controlled_rotate_token(serial, clone, country="us"):
     """
-    One deliberate new session after a failure (IP_MASK path).
-    Sticky stays preferred; only runs when caller opts into rotate-after-fail.
+    One deliberate new session after a failure (IP_MASK path) or exit collision.
+    Sticky stays preferred; only runs when caller opts into rotate.
+    Entropy suffix so Floppy/IPRoyal actually hand a new sticky node (shared
+    exit 171.231… 2026-09-05: _rotN alone still collapsed).
     """
+    import secrets
     k = clone_key(serial, clone)
     if not k:
-        return "a0000_rot1", (country or "us").strip().lower() or "us"
+        return "a0000_rot1%s" % secrets.token_hex(3), (country or "us").strip().lower() or "us"
     prev = get(serial, clone) or {}
     base = (prev.get("session") or "a0000").split("_rot")[0]
     n = int(prev.get("rotate_n") or 0) + 1
     cc = (country or prev.get("country") or "us").strip().lower() or "us"
-    token = "%s_rot%d" % (base, n)
+    token = "%s_rot%d%s" % (base, n, secrets.token_hex(3))
     data = _load()
     row = dict(data.get(k) or {})
     row["rotate_n"] = n

@@ -26,6 +26,7 @@ post_results.csv
 ig_post_results.csv
 ig_sticky_ip.json
 ig_content_lines.json
+ig_exit_claims.json
 ig_account_status.json
 ig_account_clone.json
 ig_account_drive_map.json
