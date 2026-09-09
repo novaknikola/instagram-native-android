@@ -41,8 +41,13 @@ CURRENT_REMOTE_STEM = None  # basename stem of last push (gallery match)
 # Last successful uiautomator XML — dump timeouts on Reels/caption preview
 # return this instead of sitting 20s×4 on a playing video.
 _LAST_XML = ""
-# (name, t0, deadline) — operator: no UI section may sit > 60s.
+# Last dump() wall time in ms (observability for phase boundaries).
+_LAST_DUMP_MS = None
+# (name, t0, deadline) — absolute phase deadline (not inactivity).
+# Create uses create_open/create; composer splits into caption_prep / share / share_nux.
 _SECTION = None
+# Disabled-Share wait: last CTA signature for activity sub-budget resets.
+_SHARE_WAIT_SIG = None
 
 try:
     import ig_reel_trace as rt
@@ -186,6 +191,9 @@ def _rt_fail(phase, **fields):
 def _reel_at_caption(xml=None):
     """True caption screen for Reels — not music/search EditText alone."""
     xml = xml or dump()
+    # Your-algorithm interests UI is not caption (sage/pecntiag 2026-09-09).
+    if _is_your_algorithm_screen(xml):
+        return False
     tb = text_block(xml)
     if in_caption_screen(xml):
         return True
@@ -228,7 +236,73 @@ def _section_max_sec():
     except Exception:
         v = 60
     # Hard cap 60s — sitting on caption/create staring at empty UI is the bug.
+    # Phase helpers (caption_prep/share/share_nux) pass explicit seconds instead.
     return max(15, min(v, 60))
+
+
+def _env_int_clamp(name, default, lo, hi):
+    try:
+        v = int(float(os.environ.get(name, str(default))))
+    except Exception:
+        v = int(default)
+    return max(int(lo), min(int(v), int(hi)))
+
+
+def _caption_prep_sec():
+    """Absolute deadline for EDIT→caption, overlays, typing, IME (not Share)."""
+    return _env_int_clamp("IG_CAPTION_PREP_SEC", 35, 20, 45)
+
+
+def _share_window_sec():
+    """Absolute Share-phase budget (OK+Share / disabled wait / unstick).
+
+    Farm 2026-09-07: caption prep ate a single 60s composer clock so OK+Share
+    never ran while Next was already enabled. Share is its own phase.
+    """
+    return _env_int_clamp("IG_SHARE_WINDOW_SEC", 35, 15, 45)
+
+
+def _share_nux_sec():
+    """Absolute budget for About Reels / post-Share NUX confirm."""
+    return _env_int_clamp("IG_SHARE_NUX_SEC", 30, 15, 40)
+
+
+def _verify_phase_sec():
+    """Soft verify deadline (observability + dump cap); verify polls are separate."""
+    return _env_int_clamp("IG_VERIFY_PHASE_SEC", 90, 45, 120)
+
+
+def _share_wait_hard_sec():
+    """Hard cap for disabled-Share activity wait (Emersyn-class hang bound)."""
+    return _env_int_clamp("IG_SHARE_WAIT_HARD_SEC", 22, 8, 28)
+
+
+def _share_wait_sub_sec():
+    """Inactivity sub-window inside disabled-Share wait; resets on CTA progress."""
+    return _env_int_clamp("IG_SHARE_WAIT_SUB_SEC", 8, 4, 15)
+
+
+def _phase_budget_sec(name):
+    """Default absolute seconds for a named posting phase."""
+    n = (name or "").strip().lower()
+    if n == "caption_prep":
+        return _caption_prep_sec()
+    if n == "share":
+        return _share_window_sec()
+    if n == "share_nux":
+        return _share_nux_sec()
+    if n == "verify":
+        return _verify_phase_sec()
+    if n in ("composer",):
+        # Legacy alias — prefer explicit share when publishing.
+        return _share_window_sec()
+    return _section_max_sec()
+
+
+def _section_name():
+    if not _SECTION:
+        return ""
+    return _SECTION[0] or ""
 
 
 def _section_begin(name, seconds=None):
@@ -241,6 +315,29 @@ def _section_begin(name, seconds=None):
     t0 = time.time()
     _SECTION = (name, t0, t0 + sec)
     print("[budget] %s start max=%ds" % (name, sec))
+    return _SECTION
+
+
+def _phase_begin(name, seconds=None):
+    """Start an explicit posting phase with boundary observability.
+
+    Phases are absolute deadlines (wall clock from begin), not inactivity timers.
+    caption_prep must not charge Share; call _phase_begin('share') at Share entry.
+    """
+    global _SECTION
+    prev = _section_name() or "-"
+    left_was = _section_left() if _SECTION else None
+    if seconds is None:
+        sec = _phase_budget_sec(name)
+    else:
+        sec = max(5, int(seconds))
+    _section_begin(name, sec)
+    dump_ms = _LAST_DUMP_MS if _LAST_DUMP_MS is not None else "-"
+    left_s = "-"
+    if left_was is not None and left_was < 900:
+        left_s = "%.0f" % left_was
+    print("[phase] %s begin max=%ds from=%s left_was=%ss dump_ms=%s" % (
+        name, sec, prev, left_s, dump_ms))
     return _SECTION
 
 
@@ -268,8 +365,10 @@ def dump(timeout=20, attempts=4):
 
     Inside a timed section (create/composer) caption preview never goes idle, so
     default 20s×4 burned minutes. Cap those dumps at 5s×1 and reuse last XML.
+    Op-timeout only — does not reset phase budgets.
     """
-    global _LAST_XML
+    global _LAST_XML, _LAST_DUMP_MS
+    t_dump0 = time.time()
     last = ""
     attempts = max(1, int(attempts))
     timeout = float(timeout)
@@ -298,8 +397,10 @@ def dump(timeout=20, attempts=4):
             continue
         if last and "<node" in last:
             _LAST_XML = last
+            _LAST_DUMP_MS = int((time.time() - t_dump0) * 1000)
             return last
         time.sleep(0.35)
+    _LAST_DUMP_MS = int((time.time() - t_dump0) * 1000)
     return last or _LAST_XML
 
 def nodes(xml):
@@ -542,10 +643,65 @@ def _tap_reel_caption_share(xml=None, label="reel-cap-share"):
 
 
 def _wait_reel_share_ready(xml=None, waits=10, pause=0.8):
-    """Wait if Next/Share is disabled (media still binding into composer)."""
+    """Wait if Next/Share is disabled (media still binding into composer).
+
+    Absolute hard cap + activity sub-budget: CTA kind / location / tag progress
+    refreshes the sub-window; no progress until sub expires → stop (Emersyn hang).
+    Does not extend the parent share phase deadline.
+    """
+    global _SHARE_WAIT_SIG
     xml = xml or dump()
+    cleared_hash = False
+    cleared_loc_chip = False
+    hard_cap = float(_share_wait_hard_sec())
+    if _SECTION is not None:
+        hard_cap = min(hard_cap, max(6.0, _section_left()))
+    sub_sec = float(_share_wait_sub_sec())
+    hard_deadline = time.time() + hard_cap
+    sub_deadline = time.time() + min(sub_sec, hard_cap)
+    last_sig = None
     for i in range(max(1, int(waits))):
+        now = time.time()
+        if now >= hard_deadline:
+            print("[pub] share-wait hard cap (%.0fs) — stop" % hard_cap)
+            break
+        if now >= sub_deadline:
+            print("[pub] share-wait sub-budget idle — stop")
+            break
+        # Location / tag sheets hide or disable Share — clear before waiting.
+        # Attached venue chip (Remove location) once — picker may need retries.
+        did_clear = False
+        if not cleared_loc_chip and _dismiss_attached_location_chip(xml):
+            cleared_loc_chip = True
+            did_clear = True
+        elif _dismiss_location_picker(xml) or _dismiss_tag_people(xml):
+            did_clear = True
+        if did_clear:
+            # Progress: sheet cleared — refresh activity sub-budget.
+            sub_deadline = min(hard_deadline, time.time() + sub_sec)
+            print("[pub] share-wait activity — sheet dismiss, sub refresh %.0fs"
+                  % sub_sec)
+            time.sleep(0.6)
+            xml = dump()
+            last_sig = ("sheet_cleared",)
+            continue
+        # Bare '#' caption stub greys Next — clear once before more waits.
+        if not cleared_hash and _is_incomplete_hashtag_caption(xml):
+            if _clear_incomplete_hashtag_caption(xml):
+                cleared_hash = True
+                sub_deadline = min(hard_deadline, time.time() + sub_sec)
+                print("[pub] share-wait activity — cleared # stub, sub refresh")
+                xml = dump()
+                continue
         n, kind = _find_reel_caption_share_target(xml)
+        kind = kind or ""
+        sig = (kind, bool(n))
+        if last_sig is not None and sig != last_sig:
+            sub_deadline = min(hard_deadline, time.time() + sub_sec)
+            print("[pub] share-wait activity — CTA %s→%s, sub refresh %.0fs"
+                  % (last_sig[0], kind, sub_sec))
+        last_sig = sig
+        _SHARE_WAIT_SIG = sig
         if n is not None and kind in ("share_button", "share_footer"):
             if i:
                 print("[pub] reel Share/Next enabled after wait %d" % i)
@@ -563,6 +719,12 @@ def _wait_reel_share_ready(xml=None, waits=10, pause=0.8):
 def _nudge_reel_composer_for_share(xml=None):
     """Nudge caption composer so disabled Share/Next can re-bind."""
     xml = xml or dump()
+    if (_dismiss_attached_location_chip(xml) or _dismiss_location_picker(xml)
+            or _dismiss_tag_people(xml)):
+        time.sleep(0.6)
+        xml = dump()
+    if _clear_incomplete_hashtag_caption(xml):
+        xml = dump()
     sw, sh = _screen_wh(xml)
     _adb_ime_off()
     time.sleep(0.25)
@@ -575,6 +737,32 @@ def _nudge_reel_composer_for_share(xml=None):
     return dump()
 
 
+def _wait_share_enabled_after_loc_clear(xml=None, waits=8, pause=0.45):
+    """After Remove location, poll briefly for Share/Next enabled=true.
+
+    Used only by disabled-Share unstick (does not touch phase budgets).
+    """
+    xml = xml or dump()
+    retried_clear = False
+    for _ in range(max(1, int(waits))):
+        time.sleep(max(0.2, float(pause)))
+        xml = dump()
+        # One extra clear if the chip lingered a frame; avoid infinite re-tap.
+        if (not retried_clear
+                and _attached_location_clear_node(xml) is not None):
+            if _dismiss_attached_location_chip(xml):
+                retried_clear = True
+                continue
+        n, kind = _find_reel_caption_share_target(xml)
+        if n is not None and kind in ("share_button", "share_footer"):
+            return xml, True
+        if n is not None and kind not in (
+                "share_button_disabled", "share_container_disabled_btn"):
+            # Missing/other — stop early; caller continues unstick.
+            return xml, False
+    return xml, False
+
+
 def _unstick_disabled_reel_share(xml=None):
     """When Share/Next stays enabled=false, nudge composer then force-tap.
 
@@ -582,8 +770,35 @@ def _unstick_disabled_reel_share(xml=None):
     + force input-tap on the button bounds + light scroll often enables it.
     Krista 2026-09-05: single force-tap then abort left Share disabled forever —
     wait longer, nudge, then button + container taps.
+    Dalia 2026-09-06: Location Services sheet made Share absent — dismiss first.
+    imanidur95 2026-09-06: incomplete '#' caption left Next enabled=false — clear
+    that stub before force-tapping (taps alone never open About Reels).
+    savaonnell583 2026-09-08: caption + trailing '# # #' greys Next — strip
+    trailing open hashtags (non-destructive) before force-tap.
+    sage85948 2026-09-08 / emersyn39342: attached venue chip (venue_name +
+    clear_button 'Remove location') left Share enabled=false — picker dismiss
+    alone missed it; clear the chip first, then wait for Share to enable.
     """
     xml = xml or dump()
+    # sage/emersyn: content-desc=Remove location / id/clear_button on caption.
+    clear_n = _attached_location_clear_node(xml)
+    if clear_n is not None or _is_attached_location_chip(xml):
+        if _dismiss_attached_location_chip(xml):
+            xml, enabled = _wait_share_enabled_after_loc_clear(xml)
+            if enabled:
+                return _tap_reel_caption_share(
+                    xml, label="unstick-after-loc-clear")
+    elif (_dismiss_location_picker(xml) or _dismiss_tag_people(xml)):
+        time.sleep(0.8)
+        xml = dump()
+    # imanidur / savaonnell: bare or trailing incomplete '#' greys Next.
+    if _clear_incomplete_hashtag_caption(xml):
+        time.sleep(0.6)
+        xml = dump()
+        n_hash, kind_hash = _find_reel_caption_share_target(xml)
+        if n_hash is not None and kind_hash in ("share_button", "share_footer"):
+            return _tap_reel_caption_share(
+                xml, label="unstick-after-hashtag-clear")
     xml = _wait_reel_share_ready(xml, waits=12, pause=0.9)
     n, kind = _find_reel_caption_share_target(xml)
     if n is not None and kind in ("share_button", "share_footer"):
@@ -598,7 +813,15 @@ def _unstick_disabled_reel_share(xml=None):
         if "share_button_container" in rid and not _is_direct_or_row_share_rid(rid):
             if _tap_share_container_next(n2, label="unstick-container"):
                 return True
-    # Hard footer coord as last nudge (Note8 Share)
+    # Hard footer coord as last nudge (Note8 Share) — never while location sheet up
+    xml = dump()
+    if _is_location_picker_sheet(xml) or _is_attached_location_chip(xml):
+        print("[pub] unstick blocked — location still attached/picker up")
+        if _dismiss_attached_location_chip(xml) or _dismiss_location_picker(xml):
+            time.sleep(0.8)
+            xml = dump()
+        else:
+            return False
     sw, sh = _wm_size()
     if sw >= 1400 and sh >= 2800:
         tap(1068, 2762)
@@ -620,6 +843,10 @@ def _reel_share_stuck_system_back():
     time.sleep(0.3)
     xml = dump()
     # Rare leftover sheets only — main case is already past About Reels.
+    if _is_location_picker_sheet(xml):
+        _dismiss_location_picker(xml)
+        time.sleep(0.8)
+        xml = dump()
     if _is_tag_people_sheet(xml):
         _dismiss_tag_people(xml)
         time.sleep(0.8)
@@ -673,8 +900,8 @@ def _reel_share_stuck_system_back():
     print("[pub] after stuck-BACK state=%s caption=%s true_edit=%s"
           % (st, _is_caption_composer(xml), _is_true_reel_edit(xml)))
     if _SECTION is not None and _section_left() < 15:
-        _section_begin("composer", 50)
-        print("[pub] stuck-BACK — composer budget refreshed 50s")
+        _phase_begin("share")
+        print("[pub] stuck-BACK — share phase refreshed")
     return xml
 
 
@@ -697,6 +924,118 @@ def _vision_tap(name, question="", tag=""):
 
 def edits(xml):
     return [n for n in nodes(xml) if "EditText" in attr(n, "class")]
+
+
+def _caption_field_nodes(xml=None):
+    """Caption editors: EditText OR AutoCompleteTextView (New reel caption_input).
+
+    imanidur95 2026-09-06 hang: class=AutoCompleteTextView id=caption_input_text_view
+    — edits() missed it, typing path thought the field was empty, leftover '  # '
+    kept share_button Next enabled=false forever (About Reels never appeared).
+    """
+    xml = xml or dump()
+    out = []
+    for n in nodes(xml):
+        cls = attr(n, "class")
+        rid = attr(n, "resource-id").lower()
+        d = attr(n, "content-desc").strip().lower()
+        if "EditText" in cls:
+            out.append(n)
+            continue
+        if "AutoCompleteTextView" not in cls:
+            continue
+        if "caption_input" in rid or "caption_text" in rid or "write a caption" in d \
+           or "add a caption" in d:
+            out.append(n)
+    return out
+
+
+def _caption_field_text(xml=None):
+    """Visible caption text from caption_input / EditText (not placeholder-only)."""
+    xml = xml or dump()
+    for n in _caption_field_nodes(xml):
+        t = attr(n, "text").strip()
+        tl = t.lower()
+        if not t:
+            continue
+        if tl.startswith("add a caption") or tl.startswith("write a caption"):
+            continue
+        return t
+    return ""
+
+
+def _is_incomplete_hashtag_caption(xml=None):
+    """True when caption has an open/incomplete hashtag compose stub.
+
+    IG greys Next/Share while a trailing incomplete hashtag is open
+    (hung dump text='  # ' + share_button enabled=false).
+    savaonnell583 2026-09-08: real caption + trailing '# # # #' also greys Next
+    — bare-stub-only detection missed it.
+    """
+    t = _caption_field_text(xml).strip()
+    if not t:
+        return False
+    if re.fullmatch(r"#+\s*", t):
+        return True
+    # "# " / "  # " already covered by strip+fullmatch; keep short trailing-hash
+    if len(t) <= 3 and t.rstrip().endswith("#") and not re.search(r"[A-Za-z0-9_]", t):
+        return True
+    # Complete hashtag at end (#foo) is fine; bare trailing # / # # ## is not.
+    if re.search(r"#[\w]+$", t):
+        return False
+    if re.search(r"#+\s*$", t):
+        return True
+    return False
+
+
+def _clear_incomplete_hashtag_caption(xml=None):
+    """Clear bare/trailing '#' caption stub so Share/Next can enable.
+
+    Prefer stripping trailing '# # #' so the real caption survives
+    (savaonnell583); fall back to full clear for bare '#' stubs.
+    liam45225 2026-09-09: MOVE_END+DEL alone left '…07:35:00#' intact on
+    AutoCompleteTextView — verify after strip; if still open, clear+retype keep.
+    """
+    xml = xml or dump()
+    if not _is_incomplete_hashtag_caption(xml):
+        return False
+    raw = _caption_field_text(xml)
+    print("[pub] incomplete hashtag caption %r — clear so Share can enable"
+          % ((raw or "")[:40],))
+    fields = _caption_field_nodes(xml)
+    if fields:
+        tapn(fields[0], "caption-clear-hashtag")
+        time.sleep(0.35)
+    else:
+        _focus_caption_field(xml)
+        time.sleep(0.35)
+    keep = re.sub(r"(?:\s*#+)+\s*$", "", raw or "").rstrip()
+    if keep and keep != (raw or "").strip():
+        # Non-destructive: DEL only the trailing open-hashtag junk.
+        adb("shell", "input", "keyevent", "KEYCODE_MOVE_END")
+        time.sleep(0.15)
+        n_del = min(40, max(8, len(raw) - len(keep) + 4))
+        for _ in range(n_del):
+            adb("shell", "input", "keyevent", "KEYCODE_DEL")
+        time.sleep(0.35)
+        xml2 = dump()
+        if _is_incomplete_hashtag_caption(xml2):
+            print("[pub] trailing # strip failed — clear+retype keep=%r"
+                  % (keep[:40],))
+            if _caption_field_nodes(xml2):
+                tapn(_caption_field_nodes(xml2)[0], "caption-clear-hashtag-retry")
+                time.sleep(0.25)
+            clear_field()
+            time.sleep(0.2)
+            type_text(keep, human=False)
+            time.sleep(0.35)
+    else:
+        clear_field()
+        time.sleep(0.35)
+    _dismiss_caption_keyboard(dump())
+    time.sleep(0.5)
+    return True
+
 
 def clear_field():
     # KEYCODE_CTRL_A is not a real single Android keyevent (input keyevent can't
@@ -2011,19 +2350,68 @@ def _desc_is_selected(d):
     return bool(re.search(r"\bselected\b", d))
 
 
+def _desc_is_feed_or_viewer_video(d):
+    """Home/Reels in-feed media — NOT gallery Recents thumbnails.
+
+    savaonnell583 2026-09-08: FEED carousel desc
+    'Video 1 of 3 by Eating Healthy Today, Liked by …' matched
+    gallery pick via startswith('video ') → advance_timeout on FEED.
+    """
+    d = (d or "").lower().strip()
+    if not d:
+        return False
+    if re.search(r"\bvideo\s+\d+\s+of\s+\d+\b", d):
+        return True
+    if "liked by" in d or re.search(r"\b\d+\s+comments?\b", d):
+        return True
+    if "double tap to play" in d or "view count" in d:
+        return True
+    if "reel by " in d or "reels by " in d:
+        return True
+    return False
+
+
 def _desc_is_video_tile(d):
     d = (d or "").lower()
-    return ("video thumbnail" in d or "video," in d or
+    if _desc_is_feed_or_viewer_video(d):
+        return False
+    return ("video thumbnail" in d or
             ("video" in d and "thumbnail" in d) or
-            d.startswith("video ") or "unselected video" in d or
-            "selected video" in d)
+            "unselected video" in d or
+            "selected video" in d or
+            # Gallery: "video, 12 seconds, …" — not "Video 1 of 3 by …"
+            ("video," in d and " by " not in d))
 
 
 def _desc_is_photo_tile(d):
     d = (d or "").lower()
+    if _desc_is_feed_or_viewer_video(d):
+        return False
     return ("photo thumbnail" in d or "photo taken" in d or
             "unselected photo" in d or "selected photo" in d or
             ("image" in d and "video" not in d))
+
+
+def _gallery_tile_bounds_ok(bounds):
+    """Reject near-full-bleed feed media cells mistaken for Recents thumbs."""
+    if not bounds or len(bounds) != 4:
+        return False
+    x1, y1, x2, y2 = bounds
+    w, h = max(0, x2 - x1), max(0, y2 - y1)
+    if w < 80 or h < 80:
+        return False
+    sw, sh = 1440, 2960
+    try:
+        sw2, sh2 = _wm_size()
+        if sw2 and sh2:
+            sw, sh = int(sw2), int(sh2)
+    except Exception:
+        pass
+    if w >= int(sw * 0.85) and h >= int(sh * 0.35):
+        return False
+    if (w * h) >= int(sw * sh * 0.40):
+        return False
+    return True
 
 
 def _gallery_trace_summary(xml=None):
@@ -2036,7 +2424,10 @@ def _gallery_trace_summary(xml=None):
     for n in nodes(xml):
         d = attr(n, "content-desc")
         dl = d.lower()
-        if attr(n, "clickable") == "true" and ("thumbnail" in dl or "video" in dl or "photo" in dl):
+        if attr(n, "clickable") == "true" and (
+                "thumbnail" in dl or _desc_is_video_tile(dl) or _desc_is_photo_tile(dl)):
+            if not _gallery_tile_bounds_ok(_parse_bounds(n)):
+                continue
             if _desc_is_video_tile(dl):
                 if _desc_is_selected(dl):
                     sel_v += 1
@@ -2140,6 +2531,11 @@ def _list_gallery_video_tiles(xml=None, only_unselected=True):
         if attr(n, "clickable") != "true":
             continue
         d = attr(n, "content-desc").lower()
+        rid = attr(n, "resource-id").lower()
+        if any(k in rid for k in (
+                "carousel_video", "row_feed", "clips_viewer", "zoomable_view",
+                "feed_video", "row_carousel")):
+            continue
         if not _desc_is_video_tile(d):
             continue
         if only_unselected and _desc_is_selected(d):
@@ -2147,7 +2543,7 @@ def _list_gallery_video_tiles(xml=None, only_unselected=True):
         if not only_unselected and not _desc_is_selected(d):
             continue
         b = _parse_bounds(n)
-        if not b:
+        if not b or not _gallery_tile_bounds_ok(b):
             continue
         if b in seen_bounds:
             continue
@@ -2904,12 +3300,15 @@ def _is_reel_camera(xml=None):
 
 
 def _gallery_has_video_tile(xml=None):
+    """True only for real gallery Recents video thumbs (not Home feed media)."""
     xml = xml or dump()
     for n in nodes(xml):
+        if attr(n, "clickable") != "true":
+            continue
         d = attr(n, "content-desc").lower()
-        if "video" in d and ("thumbnail" in d or "selected" in d or "unselected" in d):
-            return True
-        if d.startswith("video ") or "video," in d:
+        if not _desc_is_video_tile(d):
+            continue
+        if _gallery_tile_bounds_ok(_parse_bounds(n)):
             return True
     return False
 
@@ -3335,6 +3734,8 @@ def _reel_edit_ready(xml=None):
 def _dismiss_reel_overlays(xml=None):
     """Skip audio/music/cover prompts that block Next → caption."""
     xml = xml or dump()
+    if _dismiss_profile_grid_sort_menu(xml):
+        return True
     if _is_preview_size_tip(xml):
         return dismiss_preview_size_tip(xml, label="reel-overlay-preview")
     if tap_exact(xml,
@@ -4554,6 +4955,8 @@ def _still_in_composer(xml=None, fmt="reel"):
     tb = text_block(xml)
     if _is_giphy_overlay(xml, tb) or _is_story_to_story_nux(xml, tb):
         return True
+    if _is_location_picker_sheet(xml) or _is_tag_people_sheet(xml):
+        return True
     if fmt in ("feed", "carousel", "reel") and _is_story_editor_chrome(xml, tb):
         return True
     if any(p in tb for p in ("save draft", "write a caption", "add a caption")):
@@ -4593,6 +4996,11 @@ def _publish_succeeded(xml=None, fmt="reel"):
     """
     xml = xml or dump()
     fmt = (fmt or "reel").lower()
+    # About Reels / location / tag sheets are still pre-publish chrome.
+    if fmt == "reel" and _is_clips_nux_sheet(xml):
+        return False
+    if _is_location_picker_sheet(xml) or _is_tag_people_sheet(xml):
+        return False
     tb = text_block(xml)
     tbl = tb.lower()
     if any(p in tbl for p in ("sharing", "uploading", "posting", "processing",
@@ -4754,6 +5162,154 @@ def _is_tag_people_sheet(xml=None):
     return False
 
 
+def _is_location_picker_sheet(xml=None):
+    """Add-location / Location Services sheet covering caption Share.
+
+    Dalia 2026-09-06 POST_TIMEOUT dump: 'Select a location.' + 'Choose a location
+    to tag.' + ls_upsell_close_button / Turn on Location Services — Share/Next
+    absent or enabled=false underneath until dismissed.
+    """
+    xml = xml or dump()
+    tb = text_block(xml).lower()
+    if "select a location" in tb or "choose a location to tag" in tb:
+        return True
+    if "search for a location" in tb and (
+            "location services" in tb or "places near you" in tb or "turn on location" in tb):
+        return True
+    if "close location window" in tb:
+        return True
+    for n in nodes(xml):
+        rid = attr(n, "resource-id").lower()
+        if "ls_upsell_close_button" in rid or "ls_action_button" in rid:
+            return True
+        d = attr(n, "content-desc").strip().lower()
+        if d == "close location window":
+            return True
+    return False
+
+
+def _attached_location_clear_node(xml=None):
+    """Clickable Remove/X on an already-tagged caption location chip.
+
+    sage85948 2026-09-08 / emersyn39342 2026-09-07: metadata_location_row with
+    venue_name + id/clear_button content-desc='Remove location'. Distinct from
+    the location *picker* sheet (_is_location_picker_sheet). Attached chip left
+    Share/Next enabled=false until cleared.
+    """
+    xml = xml or dump()
+    # Prefer explicit Remove location control on the location row.
+    for n in nodes(xml):
+        if attr(n, "clickable") != "true":
+            continue
+        rid = attr(n, "resource-id").lower()
+        d = attr(n, "content-desc").strip().lower()
+        if d == "remove location":
+            return n
+        if rid.endswith("/clear_button") or rid.endswith(":id/clear_button"):
+            # Only the location-row clear (not unrelated clears).
+            if "location" in d or d == "" or "remove" in d:
+                # Require a sibling venue_name / location row in the dump.
+                if any("venue_name" in attr(n2, "resource-id").lower()
+                       or "metadata_location" in attr(n2, "resource-id").lower()
+                       for n2 in nodes(xml)):
+                    return n
+    return None
+
+
+def _is_attached_location_chip(xml=None):
+    """True when caption has a tagged venue chip (not the picker sheet)."""
+    xml = xml or dump()
+    if _is_location_picker_sheet(xml):
+        return False
+    if _attached_location_clear_node(xml) is not None:
+        return True
+    # venue_name with non-empty text on the metadata location row
+    for n in nodes(xml):
+        rid = attr(n, "resource-id").lower()
+        if "venue_name" in rid and (attr(n, "text") or "").strip():
+            return True
+    tb = text_block(xml).lower()
+    return "remove location" in tb and (
+        "add location" in tb or "metadata_location" in (xml or "").lower())
+
+
+def _dismiss_attached_location_chip(xml=None):
+    """Clear tagged location on caption composer so Share can enable.
+
+    Taps id/clear_button (content-desc Remove location). Never opens the
+    location picker (do not tap venue_name / metadata_location_first_row).
+    """
+    xml = xml or dump()
+    if not _is_attached_location_chip(xml):
+        return False
+    n = _attached_location_clear_node(xml)
+    if n is None:
+        return False
+    venue = ""
+    for n2 in nodes(xml):
+        if "venue_name" in attr(n2, "resource-id").lower():
+            venue = (attr(n2, "text") or "").strip()
+            break
+    print("[pub] attached location chip — Remove location%s"
+          % ((" (%s)" % venue[:40]) if venue else ""))
+    if tapn(n, "location-chip-remove"):
+        time.sleep(0.9)
+        return True
+    x, y = bounds_center(n)
+    if x is not None and y is not None:
+        tap(x, y)
+        print("[pub] location-chip-remove coord @ %d,%d" % (x, y))
+        time.sleep(0.9)
+        return True
+    return False
+
+
+def _dismiss_location_picker(xml=None):
+    """Close location picker / Location Services upsell — never enable GPS.
+
+    Prefer Close (ls_upsell_close_button) or Cancel/Back. Never tap
+    'Turn on Location Services' (opens system settings / burns Share).
+    """
+    xml = xml or dump()
+    if not _is_location_picker_sheet(xml):
+        return False
+    print("[pub] location picker / Location Services — dismiss before Share")
+    # 1) Explicit close on the upsell card
+    for n in nodes(xml):
+        if attr(n, "clickable") != "true":
+            continue
+        rid = attr(n, "resource-id").lower()
+        d = attr(n, "content-desc").strip().lower()
+        t = attr(n, "text").strip().lower()
+        if "ls_upsell_close_button" in rid or d == "close location window":
+            if tapn(n, "location-upsell-close"):
+                time.sleep(1.0)
+                return True
+        if "ls_action_button" in rid or "turn on location" in d or "turn on location" in t:
+            continue  # never enable Location Services
+    # 2) Action-bar Cancel / Back
+    for n in nodes(xml):
+        if attr(n, "clickable") != "true":
+            continue
+        rid = attr(n, "resource-id").lower()
+        d = attr(n, "content-desc").strip().lower()
+        t = attr(n, "text").strip().lower()
+        if "ls_action_button" in rid:
+            continue
+        if "action_bar_button_back" in rid or d in ("cancel", "close", "back") or \
+           t in ("cancel", "close"):
+            if tapn(n, "location-picker-cancel"):
+                time.sleep(1.0)
+                return True
+    if tap_exact(xml, "Cancel", "Close", "Not now", "Not Now", label="location-picker-cancel"):
+        time.sleep(1.0)
+        return True
+    adb("shell", "input", "keyevent", "KEYCODE_BACK")
+    print("[pub] KEYCODE_BACK location picker")
+    time.sleep(1.0)
+    return True
+
+
 def _dismiss_tag_people(xml=None):
     """Close tag-people sheet via Done (or Back)."""
     xml = xml or dump()
@@ -4812,6 +5368,24 @@ def _is_clips_nux_sheet(xml=None):
     return False
 
 
+def _clips_nux_share_node(xml=None):
+    """Return the About Reels NUX Share node only — never footer share_button."""
+    xml = xml or dump()
+    best = None
+    for n in nodes(xml):
+        rid = attr(n, "resource-id").lower()
+        if "clips_nux_sheet_share" not in rid:
+            continue
+        x, y = bounds_center(n)
+        if x is None or y is None:
+            continue
+        w, _h = bounds_wh(n)
+        score = (0 if attr(n, "clickable") == "true" else 1, -(w or 0), -y)
+        if best is None or score < best[0]:
+            best = (score, n)
+    return best[1] if best else None
+
+
 def _dismiss_clips_nux(xml=None):
     """Clear About-Reels NUX.
 
@@ -4819,40 +5393,52 @@ def _dismiss_clips_nux(xml=None):
     Older learn-more sheets: Cancel then use caption Share.
     Returns True if the sheet was handled (Share or Cancel).
     Sets _dismiss_clips_nux.shared=True when NUX Share was tapped (likely published).
+
+    Never tap footer share_button / bare tap_exact('Share') while this sheet is up
+    (Dalia 2026-09-05: footer Next under dimmer → POST_TIMEOUT).
     """
     xml = xml or dump()
     _dismiss_clips_nux.shared = False
     if not _is_clips_nux_sheet(xml):
         return False
     print("[pub] About Reels / clips NUX — handle before caption Share")
-    # 1) Prefer NUX Share (completes publish on About Reels confirm sheet)
+    # 1) Prefer NUX Share rid only (completes publish)
+    nux_share = _clips_nux_share_node(xml)
+    if nux_share is not None:
+        if tapn_cta(nux_share, "clips-nux-share") or tapn(nux_share, "clips-nux-share"):
+            print("[pub] About Reels — tapped NUX Share (publish)")
+            _dismiss_clips_nux.shared = True
+            time.sleep(2.5)
+            return True
+    # 2) Wide bottom-sheet Share text — exclude footer share_button / Next
+    sw, sh = _screen_wh(xml)
     for n in nodes(xml):
+        if attr(n, "clickable") != "true":
+            continue
         rid = attr(n, "resource-id").lower()
         t = attr(n, "text").strip().lower()
         d = attr(n, "content-desc").strip().lower()
-        clk = attr(n, "clickable") == "true"
-        if "clips_nux_sheet_share" in rid:
-            if tapn(n, "clips-nux-share"):
-                print("[pub] About Reels — tapped NUX Share (publish)")
-                _dismiss_clips_nux.shared = True
-                time.sleep(2.5)
-                return True
-        if clk and (t == "share" or d == "share"):
-            x, y = bounds_center(n)
-            # Prefer bottom-sheet Share (not tiny labels)
-            if y is not None and y >= 1600:
-                if tapn(n, "clips-nux-share-text"):
-                    print("[pub] About Reels — tapped Share text (publish)")
-                    _dismiss_clips_nux.shared = True
-                    time.sleep(2.5)
-                    return True
-    if tap_exact(xml, "Share", label="clips-nux-share-exact"):
-        # Only if still on NUX (avoid random Share)
-        print("[pub] About Reels — tapped Share exact")
-        _dismiss_clips_nux.shared = True
-        time.sleep(2.5)
-        return True
-    # 2) Cancel to clear sheet so caption Share becomes usable
+        if t != "share" and d != "share":
+            continue
+        if "share_button" in rid and "clips_nux" not in rid:
+            continue  # footer Next/Share under the sheet
+        if "cancel" in rid or "save_draft" in rid:
+            continue
+        x, y = bounds_center(n)
+        w, _h = bounds_wh(n)
+        if y is None:
+            continue
+        # NUX Share sits above Cancel (~y2630 on Note8); footer is ~2762
+        if y < int(sh * 0.55) or y > int(sh * 0.92):
+            continue
+        if w is not None and w < int(sw * 0.35):
+            continue
+        if tapn_cta(n, "clips-nux-share-text") or tapn(n, "clips-nux-share-text"):
+            print("[pub] About Reels — tapped Share text (publish)")
+            _dismiss_clips_nux.shared = True
+            time.sleep(2.5)
+            return True
+    # 3) Cancel only if NUX Share truly missing — clear sheet for caption retry
     for n in nodes(xml):
         if attr(n, "clickable") != "true":
             continue
@@ -4871,7 +5457,7 @@ def _dismiss_clips_nux(xml=None):
     return False
 
 
-def _poll_reel_nux_after_share(fmt="reel", waits=8, pause=0.5, grace=3):
+def _poll_reel_nux_after_share(fmt="reel", waits=10, pause=0.55, grace=5):
     """After caption Share, peek for About Reels NUX — do not sit on New reel.
 
     First-reel bug (Nylah/Dalia 2026-09-02): on an empty profile the About Reels
@@ -4879,18 +5465,15 @@ def _poll_reel_nux_after_share(fmt="reel", waits=8, pause=0.5, grace=3):
     first poll ("still caption, no NUX — skip wait"), i.e. before the sheet could
     render, so its Share (the real publish confirm) was never tapped → POST_TIMEOUT
     on an empty grid. Give the NUX a short GRACE (a few caption-only reads) to
-    appear before giving up. Bounded by `waits` and _section_expired so this can
-    never re-create the old ~10min sit (that came from waits=10 + dump timeout=8).
+    appear before giving up. Bounded by `waits` and share_nux phase deadline.
 
-    Dalia 2026-09-05: composer budget was already dead (97s/60s) when
-    clips_nux_share was tapped — poll stopped at i=0 even though NUX had been
-    on screen. Always grant a short fresh window at poll entry.
+    Always starts share_nux at entry (proactive phase), with at most ONE edge
+    reset if About Reels is up when the first window expires.
     """
     fmt = (fmt or "reel").lower()
-    # Fresh window for delayed About Reels (budget often burned on OK+Share).
-    if _SECTION is not None and _section_left() < 8:
-        _section_begin("composer", 35)
-        print("[pub] NUX poll — composer budget refreshed 35s")
+    # Proactive NUX phase — do not charge remaining Share budget for delayed sheet.
+    _phase_begin("share_nux")
+    edge_reset = False
     caption_only = 0
     for i in range(max(1, int(waits))):
         if _section_expired(need=1.5):
@@ -4898,17 +5481,27 @@ def _poll_reel_nux_after_share(fmt="reel", waits=8, pause=0.5, grace=3):
             # (Dalia 2026-09-05: stop i=0 with clips_nux_share still on screen).
             xml_b = dump(timeout=5, attempts=1)
             if _is_clips_nux_sheet(xml_b):
-                print("[pub] NUX poll — budget edge but About Reels up — reset 25s")
-                _section_begin("composer", 25)
+                if not edge_reset:
+                    print("[pub] NUX poll — budget edge but About Reels up — share_nux reset")
+                    _phase_begin("share_nux")
+                    edge_reset = True
+                else:
+                    # Last chance: tap NUX Share with whatever time remains
+                    if _dismiss_clips_nux(xml_b) and getattr(
+                            _dismiss_clips_nux, "shared", False):
+                        time.sleep(1.2)
+                        xml_ok = dump(timeout=5, attempts=1)
+                        if _publish_succeeded(xml_ok, fmt=fmt) or \
+                           not _still_in_composer(xml_ok, fmt=fmt):
+                            print("[pub] SUCCESS via About Reels NUX (budget edge)")
+                            return True
+                    print("[pub] NUX poll — budget exhausted with sheet up i=%d" % i)
+                    return False
             else:
-                print("[pub] NUX poll — composer budget, stop i=%d" % i)
+                print("[pub] NUX poll — share_nux budget, stop i=%d" % i)
                 return False
         xml = dump(timeout=5, attempts=1)
-        if _publish_succeeded(xml, fmt=fmt) or not _still_in_composer(xml, fmt=fmt):
-            print("[pub] left composer during NUX wait i=%d" % i)
-            return True
-        nux = _is_clips_nux_sheet(xml)
-        if nux:
+        if _is_clips_nux_sheet(xml):
             caption_only = 0
             if _dismiss_clips_nux(xml) and getattr(_dismiss_clips_nux, "shared", False):
                 time.sleep(1.2)
@@ -4917,10 +5510,20 @@ def _poll_reel_nux_after_share(fmt="reel", waits=8, pause=0.5, grace=3):
                    not _still_in_composer(xml_ok, fmt=fmt):
                     print("[pub] SUCCESS via About Reels NUX poll i=%d" % i)
                     return True
+                # Share confirm may leave caption briefly — keep polling, do not
+                # fall through to footer Share while NUX may still be animating.
+                if _is_clips_nux_sheet(xml_ok):
+                    print("[pub] NUX still up after Share tap i=%d — retry" % i)
+                    continue
                 print("[pub] NUX Share tapped — still in composer i=%d" % i)
-            else:
-                print("[pub] NUX sheet seen but Share miss i=%d" % i)
-        elif _is_caption_composer(xml):
+                continue
+            print("[pub] NUX sheet seen but Share miss i=%d" % i)
+            time.sleep(pause)
+            continue
+        if _publish_succeeded(xml, fmt=fmt) or not _still_in_composer(xml, fmt=fmt):
+            print("[pub] left composer during NUX wait i=%d" % i)
+            return True
+        if _is_caption_composer(xml):
             # NUX not up yet — wait a few frames before quitting (it lags Share).
             caption_only += 1
             if caption_only >= max(1, int(grace)):
@@ -4929,6 +5532,164 @@ def _poll_reel_nux_after_share(fmt="reel", waits=8, pause=0.5, grace=3):
                 return False
         time.sleep(pause)
     print("[pub] NUX wait exhausted still in composer")
+    return False
+
+
+def _is_your_algorithm_screen(xml=None):
+    """Reels 'Your algorithm' interests UI — not the caption composer.
+
+    sage85948 / pecntiag145 2026-09-09 share_timeout dumps: action_bar_title
+    'Your algorithm' + 'What you want to see more/less of'. force_caption kept
+    OK+Share-spamming on this screen until the share budget died.
+    """
+    xml = xml or dump()
+    for n in nodes(xml):
+        rid = attr(n, "resource-id").lower()
+        if "action_bar_title" not in rid:
+            continue
+        t = attr(n, "text").strip().lower()
+        d = attr(n, "content-desc").strip().lower()
+        if "your algorithm" in t or "your algorithm" in d:
+            return True
+    tb = text_block(xml).lower()
+    if "your algorithm" in tb and (
+            "what you want to see more of" in tb
+            or "what you want to see less of" in tb
+            or "interests will appear here" in tb):
+        return True
+    return False
+
+
+def _dismiss_your_algorithm_screen(xml=None):
+    """Leave Your-algorithm interests via action_bar Back. Returns True if handled."""
+    xml = xml or dump()
+    if not _is_your_algorithm_screen(xml):
+        return False
+    print("[pub] Your algorithm interests — Back (leave before Share)")
+    for n in nodes(xml):
+        rid = attr(n, "resource-id").lower()
+        if "action_bar_button_back" not in rid:
+            continue
+        if tapn(n, "algorithm-back"):
+            time.sleep(1.0)
+            return True
+    adb("shell", "input", "keyevent", "KEYCODE_BACK")
+    print("[pub] KEYCODE_BACK Your algorithm")
+    time.sleep(1.0)
+    return True
+
+
+def _is_reel_templates_tab(xml=None):
+    """Create 'TEMPLATES' / Recommended-for-you tab — not caption Share.
+
+    dakaierrez584 2026-09-09 share_timeout dump: Browse/Saved/TEMPLATES after
+    leaving caption; force_caption kept OK+Share-spamming there.
+    """
+    xml = xml or dump()
+    tb = text_block(xml).lower()
+    if "recommended for you" in tb and (
+            "templates" in tb or "browse" in tb or "saved" in tb):
+        return True
+    has_templates = False
+    has_browse_or_saved = False
+    for n in nodes(xml):
+        t = attr(n, "text").strip().lower()
+        d = attr(n, "content-desc").strip().lower()
+        if t == "templates" or d == "templates" or d.startswith("templates,"):
+            has_templates = True
+        if t in ("browse", "saved") or d.startswith("browse") or d.startswith("saved"):
+            has_browse_or_saved = True
+    return has_templates and has_browse_or_saved
+
+
+def _dismiss_reel_templates_tab(xml=None):
+    """Leave Templates tab via Back. Returns True if handled."""
+    xml = xml or dump()
+    if not _is_reel_templates_tab(xml):
+        return False
+    print("[pub] Templates tab — Back (not caption Share)")
+    for n in nodes(xml):
+        rid = attr(n, "resource-id").lower()
+        if "action_bar_button_back" in rid:
+            if tapn(n, "templates-back"):
+                time.sleep(1.0)
+                return True
+    adb("shell", "input", "keyevent", "KEYCODE_BACK")
+    print("[pub] KEYCODE_BACK Templates")
+    time.sleep(1.0)
+    return True
+
+
+def _force_caption_surface_ok(xml=None):
+    """True only when force_caption may drive OK+Share (real New-reel chrome).
+
+    Blocks Templates / gallery / Your-algorithm leftovers (dakaierrez 2026-09-09).
+    """
+    xml = xml or dump()
+    if _is_your_algorithm_screen(xml) or _is_reel_templates_tab(xml):
+        return False
+    if _is_profile_grid_sort_menu(xml):
+        return False
+    st = detect_state(xml)
+    if st in ("CREATE_PICKER", "CREATE_CHOOSER", "CREATE_CAMERA", "FEED"):
+        return False
+    if _is_caption_composer(xml) or in_caption_screen(xml) or _reel_at_caption(xml):
+        return True
+    tb = text_block(xml).lower()
+    if "new reel" in tb and any(
+            p in tb for p in ("write a caption", "add a caption", "share",
+                              "tag people", "add location")):
+        return True
+    for n in nodes(xml):
+        rid = attr(n, "resource-id").lower()
+        if "share_button" in rid and "container" not in rid and \
+           not _is_direct_or_row_share_rid(rid):
+            return True
+    return False
+
+
+def _is_profile_grid_sort_menu(xml=None):
+    """Profile Reels grid sort popup: Latest / Most viewed.
+
+    dakaierrez584 2026-09-09 advance_timeout dump was ONLY this context_menu —
+    hierarchy hid caption underneath → false stuck=UNKNOWN.
+    """
+    xml = xml or dump()
+    has_ctx = False
+    labels = set()
+    for n in nodes(xml):
+        rid = attr(n, "resource-id").lower()
+        if "context_menu" in rid:
+            has_ctx = True
+        t = attr(n, "text").strip().lower()
+        d = attr(n, "content-desc").strip().lower()
+        for s in (t, d):
+            if s in ("latest", "most viewed"):
+                labels.add(s)
+    return has_ctx and "latest" in labels and "most viewed" in labels
+
+
+def _dismiss_profile_grid_sort_menu(xml=None):
+    """Dismiss Latest/Most viewed popup via Back. Returns True if handled."""
+    xml = xml or dump()
+    if not _is_profile_grid_sort_menu(xml):
+        return False
+    print("[post] profile sort menu (Latest/Most viewed) — Back")
+    adb("shell", "input", "keyevent", "KEYCODE_BACK")
+    time.sleep(0.8)
+    return True
+
+
+def _want_caption_publish(xml, force_caption=False, true_edit=False):
+    """Whether publish loop should treat this frame as caption Share surface."""
+    if true_edit:
+        return False
+    if _is_profile_grid_sort_menu(xml):
+        return False
+    if _is_caption_composer(xml):
+        return True
+    if force_caption and _force_caption_surface_ok(xml):
+        return True
     return False
 
 
@@ -5230,7 +5991,8 @@ def _caption_keyboard_up(xml=None):
     xml = xml or dump()
     for n in nodes(xml):
         cls = attr(n, "class")
-        if "EditText" in cls and attr(n, "focused").lower() == "true":
+        if (("EditText" in cls or "AutoCompleteTextView" in cls) and
+                attr(n, "focused").lower() == "true"):
             return True
         pkg = (attr(n, "package") or "").lower()
         if any(p in pkg for p in ("inputmethod", "adbkeyboard", "latin", "samsung.android.honeyboard")):
@@ -5358,9 +6120,17 @@ def _note8_ok_then_share():
 
     Keyboard covers Share. Must OK @1347,179 first, wait, then Share @1068,2738
     (upper third of share_button 744,2696–1392,2828). Never tap Share while IME up.
+
+    Dalia 2026-09-05 POST_TIMEOUT dump: while About Reels is up, 1068,2762 lands
+    on clips_nux_sheet_cancel (Cancel @ y~2708–2840), not NUX Share @ y~2630 —
+    hard-tap would dismiss the confirm sheet without publishing.
     """
     sw, sh = _wm_size()
     if sw < 1400 or sh < 2800:
+        return False
+    xml0 = dump(timeout=4, attempts=1)
+    if xml0 and _is_clips_nux_sheet(xml0):
+        print("[pub] Note8 blocked — About Reels up (1068,2762=Cancel)")
         return False
     tap(1347, 179)
     print("[pub] Note8 OK @ 1347,179 (unfocus)")
@@ -5383,14 +6153,17 @@ def _caption_ok_then_share(xml=None):
         xml2 = dump(timeout=4, attempts=1)
         if xml2 and _caption_keyboard_up(xml2):
             print("[pub] keyboard still up - OK+Share again")
-            tap(1347, 179)
-            time.sleep(0.7)
-            _adb_ime_off()
-            time.sleep(0.35)
-            tap(1068, 2762)
-            print("[pub] Note8 Share 2nd @ 1068,2762")
-            time.sleep(0.8)
-            xml2 = dump(timeout=4, attempts=1)
+            if _is_clips_nux_sheet(xml2):
+                print("[pub] Note8 2nd blocked — About Reels up")
+            else:
+                tap(1347, 179)
+                time.sleep(0.7)
+                _adb_ime_off()
+                time.sleep(0.35)
+                tap(1068, 2762)
+                print("[pub] Note8 Share 2nd @ 1068,2762")
+                time.sleep(0.8)
+                xml2 = dump(timeout=4, attempts=1)
         # Hard coords often miss; never claim True while caption still up.
         if xml2 and (_still_on_share_caption(xml2) or _is_caption_composer(xml2)
                      or _still_in_composer(xml2, fmt="reel")):
@@ -5526,6 +6299,9 @@ def _is_caption_composer(xml=None):
     xml = xml or dump()
     if _is_true_reel_edit(xml):
         return False
+    # Not caption — Reels interests / Your algorithm (sage/pecntiag 2026-09-09).
+    if _is_your_algorithm_screen(xml):
+        return False
     st = detect_state(xml)
     if st == "CAPTION_SCREEN":
         return True
@@ -5644,8 +6420,10 @@ def _find_publish_nodes(xml, fmt="reel", allow_top_share=False):
     _sw, sh = _screen_wh(xml)
     bottom_y = int(sh * 0.68)
     out = []
+    nux_up = fmt in ("reel", "feed") and _is_clips_nux_sheet(xml)
     # Pre-resolve disabled Next/Share → container (before enabled filter).
-    if fmt in ("reel", "feed"):
+    # Skip while About Reels covers the footer (Dalia: footer Next under dimmer).
+    if fmt in ("reel", "feed") and not nux_up:
         tgt, kind = _find_reel_caption_share_target(xml)
         if tgt is not None and kind in ("share_container_disabled_btn",
                                          "share_button_disabled"):
@@ -5675,6 +6453,8 @@ def _find_publish_nodes(xml, fmt="reel", allow_top_share=False):
 
         # Newest IG feed CTA — tap even if clickable=false on wrapper
         if "share_footer_button" in rid:
+            if nux_up:
+                continue
             pri = 0
             if t in ("share", "next", "post") or d in ("share", "next", "post"):
                 pri = 0
@@ -5695,6 +6475,8 @@ def _find_publish_nodes(xml, fmt="reel", allow_top_share=False):
         # Classic share_button (Next) — never container / direct_share
         if "share_button" in rid or "share_sheet_button" in rid or \
            "post_capture_button_share" in rid:
+            if nux_up:
+                continue  # footer under About Reels — NUX Share only
             if "container" in rid:
                 continue
             if "clips_nux" in rid:
@@ -5877,6 +6659,7 @@ def _tap_share_button_any(xml=None, label="share-any", skip_xy=None):
     _tap_share_button_any.last_xy = None
     _sw, sh = _screen_wh(xml)
     bottom_y = int(sh * 0.55)
+    nux_up = _is_clips_nux_sheet(xml)
     best = None
     for n in nodes(xml):
         if attr(n, "enabled").lower() not in ("", "true"):
@@ -5897,6 +6680,8 @@ def _tap_share_button_any(xml=None, label="share-any", skip_xy=None):
         kind = None
         pri = 9
         if "share_footer_button" in rid:
+            if nux_up:
+                continue
             kind = "share_footer"
             pri = 0 if clk else 1
         elif "clips_nux_sheet_share" in rid:
@@ -5905,6 +6690,8 @@ def _tap_share_button_any(xml=None, label="share-any", skip_xy=None):
             kind = "clips_nux_share"
             pri = -1
         elif "share_button" in rid or "share_sheet_button" in rid:
+            if nux_up:
+                continue
             if "container" in rid or "save_draft" in rid or "clips_nux" in rid:
                 continue
             if _is_direct_or_row_share_rid(rid):
@@ -5925,6 +6712,10 @@ def _tap_share_button_any(xml=None, label="share-any", skip_xy=None):
             continue
         elif t in ("share", "share reel", "share now", "share post", "post") or \
              d in ("share", "share reel", "share now", "share post", "post"):
+            if nux_up and "clips_nux" not in rid:
+                # Only NUX Share text while About Reels is up
+                if not (2000 <= y <= 2700):
+                    continue
             if "also share" in t or "also share" in d:
                 continue
             if not clk and y < bottom_y:
@@ -5934,8 +6725,12 @@ def _tap_share_button_any(xml=None, label="share-any", skip_xy=None):
             pri = 3 if y >= bottom_y else 5
             if w and w >= int(_sw * 0.45) and y >= bottom_y:
                 pri = 0
+            if nux_up:
+                pri = -1
         elif clk and y >= bottom_y and (t == "next" or d == "next" or "clips_right_action" in rid
                                 or "next_button" in rid):
+            if nux_up:
+                continue
             if t == "ok" or d == "ok":
                 continue
             kind = "bottom_next"
@@ -6115,6 +6910,18 @@ def _dismiss_composer_chrome(xml=None, fmt="reel"):
     xml = xml or dump()
     fmt = (fmt or "reel").lower()
     if _dismiss_giphy_overlay(xml):
+        return True
+    # Leave Reels interests before any Share/OK hunt (sage/pecntiag 2026-09-09).
+    if fmt in ("reel", "feed", "carousel") and _dismiss_your_algorithm_screen(xml):
+        return True
+    # Templates tab is not caption (dakaierrez584 2026-09-09).
+    if fmt in ("reel", "feed", "carousel") and _dismiss_reel_templates_tab(xml):
+        return True
+    if _dismiss_attached_location_chip(xml):
+        return True
+    if _dismiss_location_picker(xml):
+        return True
+    if _dismiss_tag_people(xml):
         return True
     if _dismiss_story_to_story_nux(xml):
         if fmt in ("feed", "carousel", "reel"):
@@ -6499,8 +7306,9 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
         fmt_key = fmt
     xml = xml or dump()
     print("[pub] build=%s force_caption=%s" % (_publish_build_id(), force_caption))
-    if _SECTION is None:
-        _section_begin("composer")
+    # Share must run under its own phase — never inherit a dead caption_prep clock.
+    if _section_name() not in ("share", "share_nux"):
+        _phase_begin("share")
     _adb_ime_off()
     # Story must be on post-capture editor — gallery mode tabs are not Share.
     if fmt_key == "story" and detect_state(xml) in ("CREATE_PICKER", "CREATE_CHOOSER"):
@@ -6577,6 +7385,29 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
            not any(p in tb for p in ("write a caption", "add a caption", "tag people",
                                        "also share")):
             true_edit = True
+        # Location picker covers Share (Dalia 2026-09-06: Select a location /
+        # Location Services → Share enabled=false / missing → POST_TIMEOUT).
+        if fmt_key in ("reel", "feed") and _dismiss_location_picker(xml):
+            time.sleep(0.8)
+            xml = dump()
+            # Re-check Share after dismiss before falling into OK+Share.
+            if fmt_key == "reel":
+                xml = _wait_reel_share_ready(xml)
+            continue
+        # Your algorithm interests is NOT caption — dismiss before force_caption
+        # OK+Share (sage85948 / pecntiag145 2026-09-09 share_timeout).
+        if fmt_key in ("reel", "feed") and _dismiss_your_algorithm_screen(xml):
+            time.sleep(0.5)
+            continue
+        # Templates tab after leaving caption (dakaierrez584 2026-09-09).
+        if fmt_key in ("reel", "feed") and _dismiss_reel_templates_tab(xml):
+            time.sleep(0.5)
+            xml2 = dump()
+            # If still not caption, stop burning share budget on create chrome.
+            if not _want_caption_publish(xml2, force_caption=force_caption):
+                print("[pub] left Templates but not on caption — stop publish")
+                return False
+            continue
         # About Reels sheet already covering caption — tap its Share BEFORE
         # OK+Share footer coords (Dalia 2026-09-05: footer Next under dimmer).
         if fmt_key == "reel" and _is_clips_nux_sheet(xml):
@@ -6593,11 +7424,15 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
                 time.sleep(0.8)
                 continue
         if fmt_key in ("reel", "feed"):
-            at_caption = (not true_edit) and (force_caption or _is_caption_composer(xml))
+            at_caption = _want_caption_publish(
+                xml, force_caption=force_caption, true_edit=true_edit)
         else:
             at_caption = st == "CAPTION_SCREEN" or in_caption_screen(xml)
         if at_caption and fmt_key in ("reel", "feed") and not true_edit:
             if fmt_key == "reel":
+                if _dismiss_location_picker(xml):
+                    time.sleep(0.8)
+                    xml = dump()
                 xml = _wait_reel_share_ready(xml)
                 n_chk, kind_chk = _find_reel_caption_share_target(xml)
                 if kind_chk in ("share_button_disabled", "share_container_disabled_btn"):
@@ -6631,11 +7466,32 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
                 if _dismiss_clips_nux(xml2) and getattr(_dismiss_clips_nux, "shared", False):
                     time.sleep(1.2)
                     xml3 = dump()
-                    if _publish_succeeded(xml3, fmt=fmt_key):
+                    if _publish_succeeded(xml3, fmt=fmt_key) or \
+                       not _still_in_composer(xml3, fmt=fmt_key):
                         print("[pub] SUCCESS after OK+Share+NUX")
                         return True
+                    xml2 = xml3
+            # First-reel About Reels often lags caption Share by 1–2s (Nylah/Dalia
+            # 2026-09-02). Other CTA paths already poll; OK+Share must too before
+            # footer chip spam / Note8 retry (Cancel coords under the sheet).
+            if fmt_key == "reel" and (
+                    _still_in_composer(xml2, fmt=fmt_key)
+                    or _still_on_share_caption(xml2)
+                    or _is_clips_nux_sheet(xml2)):
+                if _poll_reel_nux_after_share(fmt=fmt_key):
+                    return True
+                xml2 = dump()
             if _still_in_composer(xml2, fmt=fmt_key) or _still_on_share_caption(xml2):
                 print("[pub] OK+Share coords missed - Share chip/rid")
+                if _is_clips_nux_sheet(xml2):
+                    if _dismiss_clips_nux(xml2) and getattr(
+                            _dismiss_clips_nux, "shared", False):
+                        time.sleep(1.2)
+                        xml2 = dump()
+                        if _publish_succeeded(xml2, fmt=fmt_key) or \
+                           not _still_in_composer(xml2, fmt=fmt_key):
+                            print("[pub] SUCCESS after OK+Share chip NUX")
+                            return True
                 n_miss, kind_miss = _find_reel_caption_share_target(xml2)
                 if kind_miss in ("share_button_disabled", "share_container_disabled_btn"):
                     print("[pub] Share still disabled after OK+Share — unstick")
@@ -6647,6 +7503,8 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
                 xml2 = dump()
                 if _publish_succeeded(xml2, fmt=fmt_key) and not _still_in_composer(xml2, fmt=fmt_key):
                     print("[pub] SUCCESS after Share chip/rid")
+                    return True
+                if fmt_key == "reel" and _poll_reel_nux_after_share(fmt=fmt_key):
                     return True
             elif detect_state(xml2) == "FEED" and not _still_in_composer(xml2, fmt=fmt_key):
                 print("[pub] SUCCESS after OK+Share (feed)")
@@ -6847,7 +7705,8 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
                                        "also share")):
             true_edit = True
         if fmt_key in ("reel", "feed"):
-            at_caption = (not true_edit) and (force_caption or _is_caption_composer(xml))
+            at_caption = _want_caption_publish(
+                xml, force_caption=force_caption, true_edit=true_edit)
         else:
             at_caption = st == "CAPTION_SCREEN" or in_caption_screen(xml)
 
@@ -6870,7 +7729,7 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
             continue
 
         # 0b) Caption field focused → top OK must confirm before Share (selinkorkmaz)
-        if (at_caption or force_caption) and fmt_key in ("reel", "feed") and not true_edit:
+        if at_caption and fmt_key in ("reel", "feed") and not true_edit:
             ok_n = _caption_ok_button(xml)
             if ok_n is not None:
                 tapn(ok_n, "pub-caption-ok")
@@ -6884,7 +7743,8 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
                     xml = dump()
                 st = detect_state(xml)
                 tb = text_block(xml)
-                at_caption = force_caption or _is_caption_composer(xml)
+                at_caption = _want_caption_publish(
+                    xml, force_caption=force_caption, true_edit=False)
 
         # Never tap Share while a real track sheet is still up
         if _is_audio_picker_overlay(xml):
@@ -6895,7 +7755,8 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
 
         # Caption Next is in the *lower* chrome (y ~78–90%). share_button
         # resource-id often maps to the IME key — hide IME then tap Next.
-        at_caption = force_caption or _is_caption_composer(xml)
+        at_caption = _want_caption_publish(
+            xml, force_caption=force_caption, true_edit=true_edit)
         if at_caption:
             _adb_ime_off()
             time.sleep(0.35)
@@ -6949,10 +7810,10 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
             time.sleep(3.5 if fmt_key != "story" else 4.0)
             xml2 = dump()
             cta_kind = getattr(_tap_publish_cta, "last_kind", None) or ""
-            # About Reels Share IS publish — give upload/leave time + budget.
+            # About Reels Share IS publish — give upload/leave time + NUX phase.
             if fmt_key == "reel" and "clips_nux" in cta_kind:
-                if _SECTION is not None and _section_left() < 10:
-                    _section_begin("composer", 40)
+                if _section_name() != "share_nux" or _section_left() < 10:
+                    _phase_begin("share_nux")
                 print("[pub] About Reels NUX Share tapped — wait leave")
                 time.sleep(2.0)
                 xml2 = dump()
@@ -6973,7 +7834,7 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
                         return True
                 # Reel: Share often opens About Reels NUX slowly. Never Back
                 # (troy 2026-09-02: face-overlay Back → EDIT_SCREEN).
-                if fmt_key == "reel" and (at_caption or force_caption):
+                if fmt_key == "reel" and at_caption:
                     if _poll_reel_nux_after_share(fmt=fmt_key):
                         return True
                     # If we already hit NUX Share, do NOT abort — footer Next/Share
@@ -7025,7 +7886,7 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
                         print("[pub] Share still disabled — unstick try %d"
                               % publish_from_composer._unstick_tries)
                         if _SECTION is not None and _section_left() < 12:
-                            _section_begin("composer", 40)
+                            _phase_begin("share")
                         _unstick_disabled_reel_share()
                         time.sleep(2.0)
                         xml_u = dump()
@@ -7051,7 +7912,7 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
                     return False
                 # Case B (feed only): transparent face over caption.
                 if (not getattr(publish_from_composer, "_face_overlay_tried", False)
-                        and (at_caption or force_caption)
+                        and at_caption
                         and fmt_key == "feed"
                         and _still_on_share_caption(xml2)):
                     publish_from_composer._face_overlay_tried = True
@@ -7063,7 +7924,7 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
                 if tapped_xy:
                     dead_cta_xy.add(tapped_xy)
                 # Reel: right-edge share_button often inert — try center footer immediately
-                if fmt_key == "reel" and (at_caption or force_caption):
+                if fmt_key == "reel" and at_caption:
                     if _tap_bottom_share_coords(fmt="reel"):
                         print("[pub] SUCCESS via center footer coord after dead CTA")
                         return True
@@ -7078,7 +7939,7 @@ def publish_from_composer(fmt="reel", xml=None, max_rounds=10, force_caption=Fal
             return True
 
         # 2) Caption: share any y, then bottom Share, then limited coords
-        if (at_caption or force_caption) and fmt_key in ("reel", "feed") and not true_edit:
+        if at_caption and fmt_key in ("reel", "feed") and not true_edit:
             if _tap_share_button_any(xml, label="pub-share-any-%d" % rnd,
                                      skip_xy=dead_cta_xy):
                 tapped_xy = getattr(_tap_share_button_any, "last_xy", None)
@@ -8175,13 +9036,15 @@ def _focus_caption_field(xml=None):
 
 
 def _caption_looks_filled(xml=None, want=""):
-    """True if caption EditText/placeholder no longer empty-only."""
+    """True if caption field no longer empty-only / incomplete hashtag stub."""
     xml = xml or dump()
+    if _is_incomplete_hashtag_caption(xml):
+        return False
     want = (want or "").strip()
     tb = text_block(xml).lower()
     if want and want[:24].lower() in tb:
         return True
-    for n in edits(xml):
+    for n in _caption_field_nodes(xml):
         t = attr(n, "text").strip()
         tl = t.lower()
         if not t:
@@ -8203,11 +9066,15 @@ def _apply_caption(caption, fmt="feed"):
         return False
     focused = _focus_caption_field()
     xml = dump()
-    es = edits(xml)
-    if es:
-        tapn(es[0], "caption-field")
+    # Prefer caption_input AutoCompleteTextView (New reel) over bare edits().
+    fields = _caption_field_nodes(xml)
+    if fields:
+        tapn(fields[0], "caption-field")
         human_pause(0.2, 0.4)
         clear_field()
+        # Drop leftover '#' stub before typing (imanidur first-reel hang).
+        if _is_incomplete_hashtag_caption(dump()):
+            clear_field()
         _type_caption_human(caption)
     elif focused:
         print("[caption] no EditText — typing into focused field")
@@ -8223,14 +9090,26 @@ def _apply_caption(caption, fmt="feed"):
         print("[caption] opened Preview — Back")
         _dismiss_media_preview(xml2)
         xml2 = dump()
+    if _is_incomplete_hashtag_caption(xml2):
+        _clear_incomplete_hashtag_caption(xml2)
+        xml2 = dump()
+        # Re-type once after clearing a stuck '#' compose.
+        fields2 = _caption_field_nodes(xml2)
+        if fields2:
+            tapn(fields2[0], "caption-retype")
+            human_pause(0.2, 0.35)
+            clear_field()
+            _type_caption_human(caption)
+            _dismiss_caption_keyboard(dump())
+            xml2 = dump()
     filled = _caption_looks_filled(xml2, want=caption)
-    print("[caption] focused=%s filled=%s edits=%s"
-          % (focused, filled, [attr(n, "text")[:40] for n in edits(xml2)]))
+    print("[caption] focused=%s filled=%s fields=%s"
+          % (focused, filled,
+             [attr(n, "text")[:40] for n in _caption_field_nodes(xml2)]))
     if filled:
         return True
     print("[caption] WARN empty after type — Share anyway (no retry sit)")
     return False
-
 
 def _tap_chooser_post_exact(xml):
     """Tap ONLY exact Post / New post on create chooser — never substring 'Post'.
@@ -8881,6 +9760,8 @@ def _advance_to_caption(dest="feed", carousel=False, pick_count=1):
             continue
 
         if st == "UNKNOWN":
+            if _dismiss_profile_grid_sort_menu(xml):
+                continue
             if _is_preview_size_tip(xml, tb) or ("got it" in tb and "preview" in tb):
                 if dismiss_preview_size_tip(xml, label="unknown-preview"):
                     tip_stuck = 0
@@ -10409,6 +11290,8 @@ def verify_post_live(username="", prefer_reels=False):
     the new photo — check media tiles before treating as empty; do not short-
     circuit on zero count alone.
     """
+    # Soft verify phase: dump cap + observability; polls remain attempt-bounded.
+    _phase_begin("verify")
     polls = 14 if prefer_reels else 10
     for _ in range(polls):
         tb = text_block(dump()).lower()
@@ -10598,13 +11481,15 @@ def peek_own_post_live(username="", prefer_reels=False):
 
 
 def _desc_is_live_story_ring(d, u=""):
-    """True ONLY for a live own-story ring — never the empty 'Add to story' affordance.
+    """True ONLY for a live own-story ring — never empty profile chrome.
 
-    The add-story button is always present and its desc ('Add to your story')
-    contains the substring 'your story', so the old check matched it and reported
-    every story as live. Exclude the add affordance BEFORE matching, then accept a
-    real live signal: 'Your story', "<username>'s story", or a seen-count ('0 of N'
-    / 'unseen'). Mirrors _open_own_story_view, which already excludes the affordance.
+    Reject false positives ops called out:
+      - 'Add to your story' / add affordance
+      - bare 'Your story' with no live evidence
+      - bare '0 of N' chrome without ownership/unseen
+    Accept: "<username>'s story" (IG often appends ', 0 of 1, unseen' for a LIVE
+    ring with zero views — that is NOT empty chrome), or 'Your story' paired with
+    unseen/new evidence.
     """
     d = (d or "").strip().lower()
     u = (u or "").strip().lower()
@@ -10615,27 +11500,51 @@ def _desc_is_live_story_ring(d, u=""):
         return False
     if "highlight" in d or "close friends" in d or "create" in d:
         return False
-    if d.endswith("'s story") or (u and ("%s's story" % u) in d):
+    bare = re.sub(r"[.\s]+$", "", d)
+    if bare in ("your story", "story"):
+        return False
+    # Strong: username ownership (may include ', 0 of 1, unseen' view chrome)
+    if u and ("%s's story" % u) in d:
         return True
-    if "your story" in d:
+    if "'s story" in d and "add" not in d:
         return True
-    # Story tray/viewer seen-count only renders when a story actually exists
-    if re.search(r"\b0 of \d", d) or "unseen" in d or "new items" in d:
+    # 'Your story' only with live evidence (unseen / new items / seen-by)
+    if "your story" in d and any(
+            p in d for p in ("unseen", "new item", "new story", "seen by", "viewers")):
         return True
+    if "unseen" in d and "story" in d and "add" not in d and "0 unseen" not in d:
+        return True
+    # Bare view-count / empty tray without ownership
+    if re.search(r"\b0 of \d", d):
+        return False
     return False
 
 
 def verify_story_live(username=""):
     """Confirm own profile shows a LIVE story ring. Fail-closed — no soft POST_DONE.
 
-    The empty 'Add to story' affordance is always on-screen and its desc contains
-    the substring 'your story' — the old check matched it (and a bare tb 'your
-    story') and reported every story as live. Require a *clickable* ring whose desc
-    is a genuine live-story signal (see _desc_is_live_story_ring) and bail on any
-    block state, so we only return POST_DONE when the story is actually live.
+    Never treat empty 'Add to story', bare 'Your story', or bare '0 of N' as live.
+    Require a clickable ring whose desc passes _desc_is_live_story_ring.
+    Inconclusive / failed verification always returns POST_BLOCKED (never POST_DONE).
     """
     time.sleep(4)
     u = (username or "").strip().lower()
+
+    def _scan_live(xml):
+        for n in nodes(xml):
+            if attr(n, "clickable") != "true":
+                continue
+            d = attr(n, "content-desc").lower()
+            if _desc_is_live_story_ring(d, u):
+                print("[OK] STORY_LIVE (story ring): %s" % d[:60])
+                return True
+        return False
+
+    # FEED tray often already shows "<user>'s story, 0 of 1, unseen" right after share
+    # (Jazlene 2026-09-06) — accept before profile nav (profile-tab can miss).
+    xml0 = dump()
+    if _scan_live(xml0):
+        return "POST_DONE"
     if not _escape_to_profile():
         print("[post] story verify — profile unreachable")
         return emit_fail("POST_BLOCKED", note="story_profile_missing")
@@ -10650,13 +11559,8 @@ def verify_story_live(username=""):
                 return fail_action_limit("story_verify")
             return emit_fail("POST_CAPTCHA" if st in ("CAPTCHA", "HUMAN_CHECK")
                              else "POST_BLOCKED")
-        for n in nodes(xml):
-            if attr(n, "clickable") != "true":
-                continue
-            d = attr(n, "content-desc").lower()
-            if _desc_is_live_story_ring(d, u):
-                print("[OK] STORY_LIVE (story ring): %s" % d[:60])
-                return "POST_DONE"
+        if _scan_live(xml):
+            return "POST_DONE"
         time.sleep(2.0)
         if not _escape_to_profile():
             break
@@ -10871,9 +11775,17 @@ def _do_post_body(caption=CAPTION, image_path=None, username="", pkg=None,
             nonlocal recovered
             # Only SEND after a true video selection — otherwise share-sheet loop
             if fmt == "reel" and not _reel_pick_succeeded(dump())[0]:
-                gsum = _gallery_trace_summary()
+                xml_g = dump()
+                st_g = detect_state(xml_g)
+                # Never treat Home feed carousel video as gallery tiles
+                # (savaonnell583 2026-09-08 advance_timeout).
+                if st_g == "FEED":
+                    print("[post] %s: on FEED — skip false gallery pick" % tag)
+                    _rt_log("%s_skip" % tag, reason="on_feed_not_gallery")
+                    return
+                gsum = _gallery_trace_summary(xml_g)
                 # Gallery already showing videos — pick then continue (don't no-op skip)
-                if gsum.get("unsel_video", 0) > 0 or _gallery_has_video_tile():
+                if gsum.get("unsel_video", 0) > 0 or _gallery_has_video_tile(xml_g):
                     print("[post] %s: tiles up, pick before SEND" % tag)
                     _section_begin("create", 45)
                     if pick_reel_video(max_attempts=6) and _reel_pick_succeeded(dump())[0]:
@@ -10933,6 +11845,8 @@ def _do_post_body(caption=CAPTION, image_path=None, username="", pkg=None,
             _section_begin("create", 50)
             _ensure_ig_foreground(CURRENT_PKG, hard=True)
             xml_r = dump()
+            if _dismiss_profile_grid_sort_menu(xml_r):
+                xml_r = dump()
             st_early = detect_state(xml_r)
             tb_early = text_block(xml_r).lower()
             # First advance often dies on budget right after Next — caption is already up.
@@ -10979,6 +11893,20 @@ def _do_post_body(caption=CAPTION, image_path=None, username="", pkg=None,
                 else:
                     _send_recover_loop("send_recover2")
 
+        # Budget can expire mid-recover while caption is already up (imanidur
+        # 2026-09-06: dump CAPTION_SCREEN / Write a caption after POST_TIMEOUT).
+        if not recovered:
+            xml_chk = dump()
+            if _dismiss_profile_grid_sort_menu(xml_chk):
+                xml_chk = dump()
+            tb_chk = text_block(xml_chk).lower()
+            if (detect_state(xml_chk) == "CAPTION_SCREEN" or in_caption_screen(xml_chk) or
+                (fmt == "reel" and _reel_at_caption(xml_chk)) or
+                ("write a caption" in tb_chk and "edit cover" in tb_chk)):
+                print("[post] caption already up after recover — continue")
+                recovered = True
+                _rt_log("recover_caption_late")
+
         if not recovered:
             print("[FAIL] never reached caption/share (stuck=%s format=%s)" % (st2, fmt))
             if fmt == "reel":
@@ -11014,7 +11942,7 @@ def _do_post_body(caption=CAPTION, image_path=None, username="", pkg=None,
                 break
             human_pause(0.35, 0.7)
         human_think()
-        _section_begin("composer")
+        _phase_begin("share")
         shared = publish_from_composer(fmt="story", max_rounds=6)
         if not shared:
             # Fallback legacy CTAs once
@@ -11070,7 +11998,8 @@ def _do_post_body(caption=CAPTION, image_path=None, username="", pkg=None,
     adb("shell", "ime", "enable", "com.android.adbkeyboard/.AdbIME")
     adb("shell", "ime", "set", "com.android.adbkeyboard/.AdbIME")
     time.sleep(0.35)
-    _section_begin("composer")
+    # caption_prep is a separate absolute phase from Share (farm 2026-09-07).
+    _phase_begin("caption_prep")
     # Reel may still be on EDIT (AI label) — advance Next into caption before typing
     if fmt == "reel":
         for _ in range(3):
@@ -11143,13 +12072,29 @@ def _do_post_body(caption=CAPTION, image_path=None, username="", pkg=None,
     _rt_log("pre_share", fmt=fmt, state=detect_state(xml_ps),
             caption=True, force_caption=True,
             snippet=text_block(xml_ps)[:220])
-    if _section_expired(need=4):
-        print("[FAIL] composer budget before Share")
+    # Proactive Share phase: always start at Share entry so caption_prep cannot
+    # consume the OK+Share budget (even when prep still had seconds left).
+    if not (_is_caption_composer(xml_ps) or _still_in_composer(xml_ps, fmt=pub_fmt)):
+        print("[FAIL] left composer before Share (phase=%s left=%.0fs)" % (
+            _section_name() or "-", _section_left()))
         return emit_fail("POST_TIMEOUT")
+    prep_left = _section_left() if _section_name() == "caption_prep" else None
+    _phase_begin("share")
+    if prep_left is not None and prep_left < 4:
+        print("[post] caption_prep exhausted (left=%.0fs) — share phase reserved"
+              % prep_left)
     # Always force caption publish path after typing — never top edit Next
     # Meghan 2026-09-05: max_rounds=2 died before container Next retry + NUX.
     shared = publish_from_composer(
         fmt=pub_fmt, max_rounds=8 if fmt == "reel" else 3, force_caption=True)
+    if not shared and fmt == "reel":
+        xml_early = dump()
+        if _publish_succeeded(xml_early, fmt=pub_fmt) or (
+                not _still_in_composer(xml_early, fmt=pub_fmt)
+                and detect_state(xml_early) in ("FEED", "PROFILE")):
+            print("[pub] first Share pass False but already left composer (st=%s)"
+                  % detect_state(xml_early))
+            shared = True
     if not shared and fmt == "reel":
         # Last-chance: system BACK off stuck caption, then one more publish pass.
         print("[post] post-Share limbo — system BACK recovery then one more publish")
@@ -11159,10 +12104,22 @@ def _do_post_body(caption=CAPTION, image_path=None, username="", pkg=None,
             _tap_edit_advance_next(xml_rec, label="post-back-recov-edit-next") or \
                 _tap_publish_cta(xml_rec, fmt="reel", label="post-back-recov-next")
             time.sleep(1.5)
-        if _SECTION is not None and _section_left() < 12:
-            _section_begin("composer", 45)
+        if _SECTION is not None and (
+                _section_name() != "share" or _section_left() < 12):
+            _phase_begin("share")
         shared = publish_from_composer(
             fmt=pub_fmt, max_rounds=4, force_caption=True)
+    if not shared:
+        # dakaierrez584 2026-09-09: OK+Share actually published, then dump timeouts
+        # + stuck-BACK recovery wandered (algorithm/camera) while FEED already
+        # showed "posted a video 1 minute ago". Treat left-composer / FEED as OK.
+        xml_done = dump()
+        if _publish_succeeded(xml_done, fmt=pub_fmt) or (
+                not _still_in_composer(xml_done, fmt=pub_fmt)
+                and detect_state(xml_done) in ("FEED", "PROFILE")):
+            print("[pub] share returned False but left composer (st=%s) — treat success"
+                  % detect_state(xml_done))
+            shared = True
     if not shared:
         hit = _check_action_limit(note="share_blocked")
         if hit:

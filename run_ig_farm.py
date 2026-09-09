@@ -8,6 +8,7 @@
 #                         [--allow-unproven] [--serial] [--format feed|reel|carousel|story]
 #                         [--formats reel,feed,story] [--story-link URL] [--highlight TITLE]
 #                         [--stagger 2] [--no-record] [--login-only] [--warmup]
+#                         [--reset-ledger]  # ignore ig_batch_results done-skips (POST_DONE / dead login)
 #
 # Default: PARALLEL phones (Threads-style). Pass --serial for one phone at a time.
 # Screen recordings ON by default (per device recordings/<stamp>/). Escape: --no-record.
@@ -53,6 +54,7 @@ USE_CLONE_ALLOW = False  # native farm: no Nomix allowlist
 NO_RECORD = False  # screen recordings ON by default (Threads-style)
 LOGIN_ONLY = False  # login + force-stop; no warmup/post
 FORCE_WARMUP = False  # Reels warmup before post
+RESET_LEDGER = False  # ignore done-skips from ig_batch_results.csv
 
 RESULTS_CSV = os.path.join(ROOT, 'ig_batch_results.csv')
 THREADS_RESULTS = os.path.join(ROOT, 'batch_results.csv')
@@ -67,6 +69,7 @@ for k in range(len(a)):
     if a[k] == "--no-record":                        NO_RECORD = True
     if a[k] == "--login-only":                       LOGIN_ONLY = True
     if a[k] == "--warmup":                           FORCE_WARMUP = True
+    if a[k] == "--reset-ledger":                     RESET_LEDGER = True
     if k + 1 < len(a):
         if a[k] == "--country":     COUNTRY = a[k + 1]
         if a[k] == "--start":       START   = int(a[k + 1])
@@ -188,7 +191,9 @@ devs  = DEVICES if DEVICES else devices()
 accts = list(csv.DictReader(open(t.CSVPATH, encoding="utf-8")))
 
 TRIED = set()
-if os.path.exists(RESULTS_CSV):
+if RESET_LEDGER:
+    print("done-ledger: RESET (--reset-ledger) — not skipping prior POST_DONE/dead logins")
+elif os.path.exists(RESULTS_CSV):
     # CAPTCHA / old ALL_IPS_MASKED rows are retryable (Floppy was fine; IG
     # showed a puzzle). Do not treat them as burned accounts.
     DEAD_LOGIN = {"ACCOUNT_SUSPENDED", "ACCOUNT_CHALLENGED",
